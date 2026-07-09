@@ -1,14 +1,22 @@
 {
   "name": "@zincapp/znvault-plugin-archon",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Archon deployment plugin for zn-vault-agent + znvault CLI (diff deploy, Prisma dynamic-secret migrations, service/reboot control)",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "exports": {
-    ".": { "import": "./dist/index.js", "types": "./dist/index.d.ts" },
-    "./cli": { "import": "./dist/cli.js", "types": "./dist/cli.d.ts" }
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./cli": {
+      "import": "./dist/cli.js",
+      "types": "./dist/cli.d.ts"
+    }
   },
   "scripts": {
     "build": "tsc",
@@ -28,8 +36,12 @@
     "@zincapp/znvault-cli": ">=2.11.0"
   },
   "peerDependenciesMeta": {
-    "@zincapp/zn-vault-agent": { "optional": true },
-    "@zincapp/znvault-cli": { "optional": true }
+    "@zincapp/zn-vault-agent": {
+      "optional": true
+    },
+    "@zincapp/znvault-cli": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/node": "^25.0.10",
