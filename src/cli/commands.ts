@@ -441,7 +441,8 @@ function registerDeployCommands(deployCmd: Command, ctx: CLIPluginContext, deps?
             };
 
             const isServing = hasActiveServerMap(rc.haproxy) && !options.skipDrain;
-            let successful = 0, failed = 0, healthCheckFailed = 0;
+            const failed = 0;
+            let successful = 0, healthCheckFailed = 0;
             const results = new Map<string, DeployToHostResult>();
 
             if (isServing) {

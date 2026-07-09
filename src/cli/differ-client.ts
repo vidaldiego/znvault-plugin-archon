@@ -12,72 +12,28 @@
 // root files) so a hash mismatch on either side means "this file differs",
 // never "this file isn't tracked by one side."
 
-import { createHash } from 'node:crypto';
+// SINGLE SOURCE OF TRUTH: the managed-set definition + hashing lives ONLY in
+// src/differ.ts (hashManagedFiles). The agent hashes the remote tree with it
+// and the CLI hashes the local build with the SAME function here, so the two
+// manifests can never disagree about which files/sets are tracked — a hash
+// difference always means "this file's content differs", never "one side
+// doesn't track this set". Do NOT re-declare SETS/walk here.
 import { promises as fs } from 'node:fs';
-import { join, sep } from 'node:path';
+import { join } from 'node:path';
+import { hashManagedFiles, type HashManifest } from '../differ.js';
 
-export interface LocalFileHash {
-  path: string;
-  sha256: string;
-}
-
-export interface LocalHashManifest {
-  [set: string]: LocalFileHash[];
-}
-
-/** Remote manifest shape returned by GET /plugins/archon/hashes (src/differ.ts's HashManifest). */
-export type RemoteHashManifest = LocalHashManifest;
-
-const SETS: { key: string; dir: string; skip?: (p: string) => boolean }[] = [
-  { key: 'dist', dir: 'dist', skip: (p) => p.endsWith('.map') },
-  { key: 'prisma', dir: 'prisma' },
-  { key: 'archon-crypt', dir: 'scripts/archon-crypt/dist' },
-];
-const ROOT_FILES = ['package.json', 'package-lock.json'];
-
-async function walk(base: string, dir: string, skip?: (p: string) => boolean): Promise<LocalFileHash[]> {
-  const out: LocalFileHash[] = [];
-  let entries: import('node:fs').Dirent[];
-  try {
-    entries = await fs.readdir(join(base, dir), { withFileTypes: true });
-  } catch {
-    return out; // set absent locally = empty
-  }
-  for (const e of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-    const rel = join(dir, e.name);
-    if (e.isDirectory()) {
-      out.push(...(await walk(base, rel, skip)));
-    } else {
-      const posix = rel.split(sep).join('/');
-      if (skip?.(posix)) continue;
-      const buf = await fs.readFile(join(base, rel));
-      out.push({ path: posix, sha256: createHash('sha256').update(buf).digest('hex') });
-    }
-  }
-  return out;
-}
+/** Local manifest = the same shape the agent produces (differ.ts's HashManifest). */
+export type LocalHashManifest = HashManifest;
+/** Remote manifest shape returned by GET /plugins/archon/hashes. */
+export type RemoteHashManifest = HashManifest;
 
 /**
- * Hash the local build output the same way the agent hashes the remote
- * managed-file sets (src/differ.ts's hashManagedFiles), so the two manifests
- * are directly comparable set-by-set.
+ * Hash the local build output with the EXACT same logic the agent uses for the
+ * remote managed-file sets — a thin alias over differ.ts's hashManagedFiles so
+ * the two sides share one definition (see the note above).
  */
 export async function hashLocalBuild(projectPath: string): Promise<LocalHashManifest> {
-  const m: LocalHashManifest = {};
-  for (const s of SETS) m[s.key] = await walk(projectPath, s.dir, s.skip);
-  const distFiles = m['dist'] ?? [];
-  m['dist/public'] = distFiles.filter((f) => f.path.startsWith('dist/public/'));
-  m['dist'] = distFiles.filter((f) => !f.path.startsWith('dist/public/'));
-  m['root'] = [];
-  for (const rf of ROOT_FILES) {
-    try {
-      const buf = await fs.readFile(join(projectPath, rf));
-      m['root'].push({ path: rf, sha256: createHash('sha256').update(buf).digest('hex') });
-    } catch {
-      /* absent locally */
-    }
-  }
-  return m;
+  return hashManagedFiles(projectPath);
 }
 
 export interface DiffPlan {
