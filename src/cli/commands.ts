@@ -21,6 +21,7 @@ import {
   type DeployConfig,
   type DeployClass,
   type ConfigStoreLocation,
+  type DeployToHostResult,
   loadDeployConfigs,
   saveDeployConfigs,
   getConfig,
@@ -41,6 +42,14 @@ import {
   clearEndpointOverride,
   type RunClassResult,
   type ResolvedClass,
+  executeStrategy,
+  parseDeploymentStrategy,
+  drainServer,
+  readyServer,
+  testHAProxyConnectivity,
+  getUnmappedHosts,
+  performHealthCheck,
+  hasActiveServerMap,
 } from '@zincapp/znvault-deploy-core';
 import { getErrorMessage } from '../utils/error.js';
 import { makeArchonRunPhase, type RunnerDeps } from './migration-runner.js';
@@ -303,12 +312,14 @@ function registerDeployCommands(deployCmd: Command, ctx: CLIPluginContext, deps?
     .option('--skip-migrations', 'Deploy without running any schema migrations')
     .option('--pre-only', 'Run only the pre-deploy migration phase, then stop (no rollout)')
     .option('--post-only', 'Run only the post-deploy migration phase, then stop — recovery')
+    .option('--skip-drain', 'Deploy without draining/readying hosts on HAProxy (serving classes only)')
     .action(async (configName: string, options: {
       dryRun?: boolean;
       class: string[];
       skipMigrations?: boolean;
       preOnly?: boolean;
       postOnly?: boolean;
+      skipDrain?: boolean;
     }) => {
       const config = await getConfig(loc, configName);
       if (!config) {
@@ -364,6 +375,29 @@ function registerDeployCommands(deployCmd: Command, ctx: CLIPluginContext, deps?
           return;
         }
 
+        // ── preflight: HAProxy connectivity + coverage, once, before any class rolls ──
+        // Only serving classes (haproxy present with a non-empty serverMap) are
+        // checked. Skipped entirely under --skip-drain, since drain won't be
+        // attempted this run.
+        if (!options.skipDrain) {
+          const servingClasses = resolved.filter((rc) => hasActiveServerMap(rc.haproxy));
+          for (const rc of servingClasses) {
+            try {
+              const connResult = await testHAProxyConnectivity(rc.haproxy!);
+              if (!connResult.success) {
+                const failedHosts = connResult.results.filter((r) => !r.success).map((r) => `${r.host}: ${r.error}`);
+                ctx.output.warn(`  [${rc.name}] HAProxy connectivity check failed: ${failedHosts.join('; ')}`);
+              }
+            } catch (err) {
+              ctx.output.warn(`  [${rc.name}] HAProxy connectivity check failed: ${getErrorMessage(err)}`);
+            }
+            const unmapped = getUnmappedHosts(rc.haproxy!, rc.hosts);
+            if (unmapped.length > 0) {
+              ctx.output.warn(`  [${rc.name}] host(s) not mapped in haproxy.serverMap (will deploy without drain): ${unmapped.join(', ')}`);
+            }
+          }
+        }
+
         const runClass = async (rc: ResolvedClass): Promise<RunClassResult> => {
           const port = rc.port ?? DEFAULT_PORT;
           const classTunnels: Tunnel[] = [];
@@ -381,29 +415,139 @@ function registerDeployCommands(deployCmd: Command, ctx: CLIPluginContext, deps?
               }
             }
 
-            let successful = 0, failed = 0;
-            for (const host of rc.hosts) {
+            // Deploy body for exactly one host: computes the diff plan and
+            // applies it. Shared by both the serving (drain-wrapped) and
+            // worker (bare) lifecycles below.
+            const deployOneHost = async (host: string): Promise<DeployToHostResult> => {
               try {
                 const pluginUrl = archonPluginUrl(host, port);
                 const getJson = (url: string) => agentGet<RemoteHashManifest>(url);
                 const { payload } = await computeDeployPlan(projectPath, rc.name, pluginUrl, getJson);
                 if (payload.files.length === 0 && payload.deletions.length === 0) {
                   ctx.output.info(`  [${rc.name}] ${host}: up to date`);
-                  successful++;
-                  continue;
+                  return { success: true, result: { success: true, filesChanged: 0, filesDeleted: 0, message: 'No changes', deploymentTime: 0, appName: rc.name } };
                 }
                 await agentPost(`${pluginUrl}/deploy`, payload);
                 ctx.output.success(`  [${rc.name}] ${host}: deployed (+${payload.files.length} -${payload.deletions.length})`);
-                successful++;
+                return {
+                  success: true,
+                  result: { success: true, filesChanged: payload.files.length, filesDeleted: payload.deletions.length, message: 'Deployed', deploymentTime: 0, appName: rc.name },
+                };
               } catch (err) {
-                ctx.output.error(`  [${rc.name}] ${host}: ${getErrorMessage(err)}`);
-                failed++;
+                const message = getErrorMessage(err);
+                ctx.output.error(`  [${rc.name}] ${host}: ${message}`);
+                return { success: false, error: message };
               }
+            };
+
+            const isServing = hasActiveServerMap(rc.haproxy) && !options.skipDrain;
+            let successful = 0, failed = 0, healthCheckFailed = 0;
+            const results = new Map<string, DeployToHostResult>();
+
+            if (isServing) {
+              // ── serving class: drain → deploy → health-gate → ready (finally re-readies on failure) ──
+              const lifecycle = async (host: string): Promise<DeployToHostResult> => {
+                let drained = false;
+                try {
+                  try {
+                    await drainServer(rc.haproxy!, host);
+                    drained = true;
+                  } catch (err) {
+                    const message = `drain failed: ${getErrorMessage(err)}`;
+                    ctx.output.error(`  [${rc.name}] ${host}: ${message}`);
+                    return { success: false, error: message };
+                  }
+
+                  const deployResult = await deployOneHost(host);
+                  if (!deployResult.success) return deployResult;
+
+                  if (rc.healthCheck) {
+                    const healthResult = await performHealthCheck(host, rc.healthCheck, (attempt, maxAttempts, status, error) => {
+                      if (error) {
+                        ctx.output.info(`  [${rc.name}] ${host}: health check ${attempt}/${maxAttempts}: ${error}`);
+                      } else if (status !== undefined) {
+                        ctx.output.info(`  [${rc.name}] ${host}: health check ${attempt}/${maxAttempts}: HTTP ${status}`);
+                      }
+                    });
+                    if (!healthResult.success) {
+                      const message = `health check failed: ${healthResult.error ?? `HTTP ${healthResult.status}`}`;
+                      ctx.output.error(`  [${rc.name}] ${host}: ${message}`);
+                      healthCheckFailed++;
+                      return { success: false, error: message };
+                    }
+                  }
+
+                  await readyServer(rc.haproxy!, host);
+                  drained = false;
+                  return deployResult;
+                } finally {
+                  if (drained) {
+                    try {
+                      await readyServer(rc.haproxy!, host);
+                    } catch {
+                      /* don't mask the original error */
+                    }
+                  }
+                }
+              };
+
+              // deploy-vs-health failure disambiguation for reporting: a host that
+              // fails its health check still lands in strategyResult.failed (its
+              // lifecycle fn returned success:false), so healthCheckFailed is
+              // reported as an additional (not additive-to-total) signal — the
+              // §3.3 gate is `failed>0 || aborted || healthCheckFailed>0`, an OR,
+              // not a partition, so double-flagging the same host is correct.
+              const strategy = parseDeploymentStrategy(rc.strategy ?? 'sequential');
+              const strategyResult = await executeStrategy(strategy, rc.hosts, lifecycle, { abortOnFailure: rc.blocking });
+              for (const [host, r] of strategyResult.results) results.set(host, r);
+
+              return {
+                ctx: {
+                  results,
+                  aborted: strategyResult.aborted,
+                  failedBatch: strategyResult.failedBatch,
+                  skipped: strategyResult.skipped,
+                  successful: strategyResult.successful,
+                  failed: strategyResult.failed,
+                  healthCheckFailed,
+                  workerFailed: 0,
+                },
+                coverageOk: strategyResult.failed === 0 && !strategyResult.aborted,
+              };
+            }
+
+            // ── worker class (no active haproxy, or --skip-drain): sequential, no drain ──
+            // Worker failures (deploy or health) are NON-BLOCKING: recorded in
+            // workerFailed, never in failed/healthCheckFailed, so they never trip
+            // the multi-class blocking gate (§3.3 — gate excludes workerFailed).
+            let workerFailed = 0;
+            for (const host of rc.hosts) {
+              const deployResult = await deployOneHost(host);
+              results.set(host, deployResult);
+              if (!deployResult.success) {
+                workerFailed++;
+                continue;
+              }
+              if (rc.healthCheck) {
+                const healthResult = await performHealthCheck(host, rc.healthCheck, (attempt, maxAttempts, status, error) => {
+                  if (error) {
+                    ctx.output.info(`  [${rc.name}] ${host}: health check ${attempt}/${maxAttempts}: ${error}`);
+                  } else if (status !== undefined) {
+                    ctx.output.info(`  [${rc.name}] ${host}: health check ${attempt}/${maxAttempts}: HTTP ${status}`);
+                  }
+                });
+                if (!healthResult.success) {
+                  ctx.output.warn(`  [${rc.name}] ${host}: worker unhealthy (non-blocking): ${healthResult.error ?? `HTTP ${healthResult.status}`}`);
+                  workerFailed++;
+                  continue;
+                }
+              }
+              successful++;
             }
 
             return {
-              ctx: { results: new Map(), aborted: false, skipped: 0, successful, failed, healthCheckFailed: 0, workerFailed: 0 },
-              coverageOk: failed === 0,
+              ctx: { results, aborted: false, skipped: 0, successful, failed, healthCheckFailed, workerFailed },
+              coverageOk: workerFailed === 0,
             };
           } finally {
             for (const host of rc.hosts) clearEndpointOverride(host);
