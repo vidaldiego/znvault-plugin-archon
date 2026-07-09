@@ -46,6 +46,35 @@ export async function hashManagedFiles(appRoot: string): Promise<HashManifest> {
 }
 
 export interface DiffInput { files: { path: string; content: string }[]; deletions: string[]; }
+
+/**
+ * Refuse to write through a symlink.
+ *
+ * The path-escape guard above (`relative(appRoot, abs).startsWith('..')`)
+ * only checks the *string* path — it does not protect against a symlink
+ * planted INSIDE appRoot that points OUTSIDE it (e.g. `dist/evil ->
+ * /etc/passwd`). Such a symlink resolves to a path inside appRoot under the
+ * string check, but `fs.writeFile` follows it and writes through to the
+ * external target. Since `/deploy` exposes this function to network input
+ * (a compromised or buggy CLI client, or a MITM'd tunnel), harden the write
+ * path: before writing, `lstat` the target's parent directory (and the
+ * target itself, if it already exists) and refuse if either is a symlink.
+ * Deletion uses `fs.rm(force: true)`, which does not follow symlinks into
+ * their targets (it removes the link itself), so the delete loop is not
+ * subject to the same class of attack and is left as-is.
+ */
+async function assertNotSymlink(path: string, label: string): Promise<void> {
+  let st;
+  try {
+    st = await fs.lstat(path);
+  } catch {
+    return; // doesn't exist yet — nothing to guard against
+  }
+  if (st.isSymbolicLink()) {
+    throw new Error(`refusing to write through symlink: ${label}`);
+  }
+}
+
 export async function applyDiff(
   appRoot: string, input: DiffInput, owner: { uid: number; gid: number },
 ): Promise<{ written: number; deleted: number }> {
@@ -53,7 +82,13 @@ export async function applyDiff(
   for (const f of input.files) {
     const abs = join(appRoot, f.path);
     if (relative(appRoot, abs).startsWith('..')) throw new Error(`path escapes appRoot: ${f.path}`);
-    await fs.mkdir(join(abs, '..'), { recursive: true });
+    const parentDir = join(abs, '..');
+    await fs.mkdir(parentDir, { recursive: true });
+    // Guard AFTER mkdir (so pre-existing real directories are covered) but
+    // BEFORE the write — mkdir is a no-op on an existing directory and
+    // will not itself follow/create through a symlink, but writeFile will.
+    await assertNotSymlink(parentDir, f.path);
+    await assertNotSymlink(abs, f.path);
     await fs.writeFile(abs, Buffer.from(f.content, 'base64'));
     await fs.chown(abs, owner.uid, owner.gid).catch(() => {});
     written++;

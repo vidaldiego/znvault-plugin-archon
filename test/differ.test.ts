@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { hashManagedFiles, applyDiff } from '../src/differ.js';
@@ -42,5 +42,48 @@ describe('applyDiff — path-traversal guard', () => {
       applyDiff(root, { files: [], deletions: ['../../etc/passwd'] }, owner),
     ).rejects.toThrow(/path escapes appRoot/);
     await rm(root, { recursive: true, force: true });
+  });
+
+  it('throws when a pre-planted symlink inside appRoot points outside it (write-loop TOCTOU)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'archon-diff-'));
+    const outside = await mkdtemp(join(tmpdir(), 'archon-outside-'));
+    await mkdir(join(root, 'dist'), { recursive: true });
+    // Plant a symlink INSIDE appRoot (dist/evil.js) pointing OUTSIDE it.
+    // The string-based path-escape guard passes (dist/evil.js resolves
+    // inside appRoot); a naive fs.writeFile would follow the link and
+    // write through to `outside`.
+    await symlink(join(outside, 'pwned.js'), join(root, 'dist', 'evil.js'));
+
+    await expect(
+      applyDiff(
+        root,
+        { files: [{ path: 'dist/evil.js', content: Buffer.from('pwned').toString('base64') }], deletions: [] },
+        owner,
+      ),
+    ).rejects.toThrow(/symlink/i);
+
+    // Prove nothing was actually written through the link.
+    await expect(readFile(join(outside, 'pwned.js'), 'utf-8')).rejects.toThrow();
+
+    await rm(root, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  });
+
+  it('throws when a symlinked directory sits in place of the target parent dir', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'archon-diff-'));
+    const outsideDir = await mkdtemp(join(tmpdir(), 'archon-outside-dir-'));
+    // dist is itself a symlink to a directory outside appRoot.
+    await symlink(outsideDir, join(root, 'dist'));
+
+    await expect(
+      applyDiff(
+        root,
+        { files: [{ path: 'dist/evil.js', content: Buffer.from('pwned').toString('base64') }], deletions: [] },
+        owner,
+      ),
+    ).rejects.toThrow(/symlink/i);
+
+    await rm(root, { recursive: true, force: true });
+    await rm(outsideDir, { recursive: true, force: true });
   });
 });
