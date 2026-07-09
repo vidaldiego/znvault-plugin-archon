@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import type { ArchonPluginConfig } from './plugin-config.js';
+import { detectArchonService } from './detect-service.js';
 
 export interface RunResult { code: number; stdout: string; stderr: string; }
 export type RunFn = (cmd: string, args: string[]) => Promise<RunResult>;
@@ -12,18 +13,42 @@ const defaultRun: RunFn = (cmd, args) => new Promise((resolve) => {
 });
 
 export class ArchonManager {
-  constructor(private readonly cfg: ArchonPluginConfig, private readonly run: RunFn = defaultRun) {}
+  /** Resolved service name, cached after the first lookup (config or detection). */
+  private resolvedService: string | undefined;
+
+  constructor(private readonly cfg: ArchonPluginConfig, private readonly run: RunFn = defaultRun) {
+    this.resolvedService = cfg.service;
+  }
+
+  /**
+   * The systemd service to act on: `config.service` when set, otherwise the
+   * single installed `archon-*.service` auto-detected. Detection throws (never
+   * guesses) when zero or >1 archon services are present. A SUCCESSFUL detection
+   * is cached for the lifetime of this manager; a THROWING detection is not
+   * cached, so a transient failure is retried on the next call rather than
+   * permanently wedging the node.
+   */
+  async getService(): Promise<string> {
+    if (this.resolvedService === undefined) {
+      // Assign only after the await resolves — a throw leaves resolvedService
+      // undefined so the next call retries (see doc comment above).
+      this.resolvedService = await detectArchonService(this.run);
+    }
+    return this.resolvedService;
+  }
 
   private async systemctl(verb: string): Promise<void> {
-    const r = await this.run('sudo', ['systemctl', verb, this.cfg.service]);
-    if (r.code !== 0) throw new Error(`systemctl ${verb} ${this.cfg.service} failed: ${r.stderr || r.code}`);
+    const service = await this.getService();
+    const r = await this.run('sudo', ['systemctl', verb, service]);
+    if (r.code !== 0) throw new Error(`systemctl ${verb} ${service} failed: ${r.stderr || r.code}`);
   }
   restart() { return this.systemctl('restart'); }
   start() { return this.systemctl('start'); }
   stop() { return this.systemctl('stop'); }
 
   async status(): Promise<{ active: boolean; raw: string }> {
-    const r = await this.run('sudo', ['systemctl', 'is-active', this.cfg.service]);
+    const service = await this.getService();
+    const r = await this.run('sudo', ['systemctl', 'is-active', service]);
     return { active: r.stdout.trim() === 'active', raw: r.stdout.trim() };
   }
 
