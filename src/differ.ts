@@ -75,6 +75,25 @@ async function assertNotSymlink(path: string, label: string): Promise<void> {
   }
 }
 
+/**
+ * Reject if ANY existing path segment between appRoot (exclusive) and the
+ * leaf target (inclusive) is a symlink. Checking only the immediate parent is
+ * insufficient: `fs.mkdir(parent, {recursive:true})` follows a pre-existing
+ * symlink at any intermediate segment (Node's `mkdir -p` traverses through
+ * an existing symlinked dir), so a symlink like `appRoot/dist -> /outside`
+ * would let a write to `dist/sub/x` land outside appRoot while the immediate
+ * parent (`dist/sub`, freshly mkdir'd, hence a real dir) passes the check.
+ * Walking every segment BEFORE the mkdir closes that gap.
+ */
+async function assertNoSymlinkInChain(appRoot: string, relPath: string): Promise<void> {
+  const segments = relPath.split(/[/\\]+/).filter((s) => s.length > 0);
+  let current = appRoot;
+  for (const seg of segments) {
+    current = join(current, seg);
+    await assertNotSymlink(current, relPath);
+  }
+}
+
 export async function applyDiff(
   appRoot: string, input: DiffInput, owner: { uid: number; gid: number },
 ): Promise<{ written: number; deleted: number }> {
@@ -82,12 +101,14 @@ export async function applyDiff(
   for (const f of input.files) {
     const abs = join(appRoot, f.path);
     if (relative(appRoot, abs).startsWith('..')) throw new Error(`path escapes appRoot: ${f.path}`);
+    // Reject a symlink at ANY existing segment BEFORE mkdir -p can traverse
+    // through it (see assertNoSymlinkInChain). Covers the immediate parent and
+    // the leaf target too.
+    await assertNoSymlinkInChain(appRoot, f.path);
     const parentDir = join(abs, '..');
     await fs.mkdir(parentDir, { recursive: true });
-    // Guard AFTER mkdir (so pre-existing real directories are covered) but
-    // BEFORE the write — mkdir is a no-op on an existing directory and
-    // will not itself follow/create through a symlink, but writeFile will.
-    await assertNotSymlink(parentDir, f.path);
+    // Re-check the leaf after mkdir: the parent now exists as a real dir, and
+    // the leaf may have been created by a concurrent path — cheap belt-and-braces.
     await assertNotSymlink(abs, f.path);
     await fs.writeFile(abs, Buffer.from(f.content, 'base64'));
     await fs.chown(abs, owner.uid, owner.gid).catch(() => {});

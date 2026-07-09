@@ -47,11 +47,19 @@ async function resolveOwner(user: string): Promise<{ uid: number; gid: number }>
     ]);
     const uid = Number.parseInt(uidRes.stdout.trim(), 10);
     const gid = Number.parseInt(gidRes.stdout.trim(), 10);
-    const owner = Number.isFinite(uid) && Number.isFinite(gid) ? { uid, gid } : { uid: 0, gid: 0 };
+    if (!Number.isFinite(uid) || !Number.isFinite(gid)) {
+      throw new Error(`could not parse uid/gid for user '${user}' (got uid='${uidRes.stdout.trim()}' gid='${gidRes.stdout.trim()}')`);
+    }
+    const owner = { uid, gid };
     ownerCache.set(user, owner);
     return owner;
-  } catch {
-    return { uid: 0, gid: 0 };
+  } catch (e) {
+    // Fail LOUDLY, do NOT silently fall back to root (uid 0). Chowning deploy
+    // files to root would break the archon service's access to its own files
+    // and be undiagnosable. Throwing here surfaces as a 500 with the journal
+    // left open (recoverable), consistent with how npm ci/prisma generate
+    // failures are handled in runPostApply.
+    throw new Error(`resolveOwner failed for user '${user}': ${e instanceof Error ? e.message : String(e)}`);
   }
 }
 

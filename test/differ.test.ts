@@ -86,4 +86,30 @@ describe('applyDiff — path-traversal guard', () => {
     await rm(root, { recursive: true, force: true });
     await rm(outsideDir, { recursive: true, force: true });
   });
+
+  it('throws when an INTERMEDIATE segment (not the immediate parent) is a symlink escaping appRoot', async () => {
+    // Reviewer-demonstrated escape: `dist` is a symlink to an outside dir, and
+    // we write `dist/sub/evil.js`. The IMMEDIATE parent (`dist/sub`) would be
+    // freshly mkdir'd (a real dir, passing an immediate-parent-only check), but
+    // `mkdir -p dist/sub` traverses THROUGH the `dist` symlink → the write would
+    // land outside appRoot. The chain walk must reject the `dist` segment first.
+    const root = await mkdtemp(join(tmpdir(), 'archon-diff-'));
+    const outsideDir = await mkdtemp(join(tmpdir(), 'archon-outside-dir-'));
+    await symlink(outsideDir, join(root, 'dist'));
+
+    await expect(
+      applyDiff(
+        root,
+        { files: [{ path: 'dist/sub/evil.js', content: Buffer.from('pwned').toString('base64') }], deletions: [] },
+        owner,
+      ),
+    ).rejects.toThrow(/symlink/i);
+
+    // And nothing was written into the outside target.
+    const { readdir } = await import('node:fs/promises');
+    expect(await readdir(outsideDir)).toEqual([]);
+
+    await rm(root, { recursive: true, force: true });
+    await rm(outsideDir, { recursive: true, force: true });
+  });
 });
