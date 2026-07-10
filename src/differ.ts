@@ -1,5 +1,6 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, relative, sep } from 'node:path';
 
 interface FileHash { path: string; sha256: string; }
@@ -46,6 +47,120 @@ export async function hashManagedFiles(appRoot: string): Promise<HashManifest> {
 }
 
 export interface DiffInput { files: { path: string; content: string }[]; deletions: string[]; }
+
+/**
+ * The mutating side of applyDiff, abstracted so the write/delete can run either
+ * directly (agent owns the tree — tests, or an agent-writable appRoot) or via
+ * `sudo -u <appUser>` (the production case: /opt/archon is owned by `archon`,
+ * not the agent user, so a direct fs.writeFile hits EACCES). The symlink guards
+ * in applyDiff are read-only and always run as the agent BEFORE these ops.
+ */
+export interface FileOps {
+  /**
+   * Write `content` to `abs`, owned by the app user, creating parents as needed.
+   * `relPath` (relative to appRoot) lets the sudo impl create each parent
+   * segment individually with a symlink guard — it must NOT create parents by
+   * following an existing symlink at any segment.
+   */
+  writeFile(appRoot: string, relPath: string, abs: string, content: Buffer): Promise<void>;
+  /** Remove `abs` if present (no error if absent). */
+  remove(abs: string): Promise<void>;
+}
+
+export interface RunResult { code: number; stdout: string; stderr: string; }
+export type RunFn = (cmd: string, args: string[]) => Promise<RunResult>;
+
+/**
+ * Direct fs ops (default). Writes as the current process user and best-effort
+ * chowns to `owner`; a chown failure is non-fatal (matches the original
+ * behavior). Correct only when the process can write appRoot (tests, or an
+ * agent-owned tree).
+ */
+export function makeDirectFileOps(owner: { uid: number; gid: number }): FileOps {
+  return {
+    async writeFile(_appRoot, _relPath, abs, content) {
+      await fs.mkdir(join(abs, '..'), { recursive: true });
+      await fs.writeFile(abs, content);
+      await fs.chown(abs, owner.uid, owner.gid).catch(() => {});
+    },
+    async remove(abs) {
+      await fs.rm(abs, { force: true });
+    },
+  };
+}
+
+/**
+ * Sudo ops (production): the app tree (/opt/archon) is owned by `user`
+ * (`archon`), not the agent, so a direct write EACCESes. Every mutation runs
+ * through `sudo` AS ROOT — NOT `sudo -u archon` — for two reasons the review
+ * of this file surfaced:
+ *
+ *  1. Read access to the staged temp file. The agent stages content into a
+ *     temp file it owns; `sudo -u archon install <tmp>` cannot READ an
+ *     agent-owned file (any mode) — different user, and 0644 still leaks it to
+ *     the world. Running install as root reads the temp file fine and
+ *     `-o <user> -g <user>` sets the final ownership to the app user.
+ *
+ *  2. Symlink safety of parent creation. `install -D` (and `mkdir -p`) TRAVERSE
+ *     an existing symlink at any intermediate segment, so a symlink planted in
+ *     the window after applyDiff's guard could redirect the write outside
+ *     appRoot — and the mutation runs privileged. So parents are created here
+ *     segment-by-segment with a per-segment symlink guard (`test ! -L` +
+ *     `mkdir` one level, never `mkdir -p`), then the file is placed with
+ *     `install -T` (no target-dir/parent creation). A symlink at any segment
+ *     makes the guard command fail → the write throws before install runs.
+ *
+ * `run` is injected (spawns in prod, mocked in tests). Any non-zero exit throws
+ * so the deploy fails loudly (journal left open) rather than skipping a file.
+ */
+export function makeSudoFileOps(user: string, run: RunFn): FileOps {
+  const check = async (r: RunResult, what: string): Promise<void> => {
+    if (r.code !== 0) throw new Error(`${what} failed (exit ${r.code}): ${r.stderr.trim() || 'unknown error'}`);
+  };
+  return {
+    async writeFile(appRoot, relPath, abs, content) {
+      // 1. Create each parent segment individually, guarding every segment
+      //    against a symlink BEFORE creating the next — never `mkdir -p`, which
+      //    would traverse a symlinked segment. Runs as root; dirs owned by user.
+      const segments = relPath.split(/[/\\]+/).filter((s) => s.length > 0);
+      segments.pop(); // drop the leaf file; we only create its ancestor dirs
+      let current = appRoot;
+      for (const seg of segments) {
+        current = join(current, seg);
+        // Refuse if this segment already exists AS A SYMLINK; else create it as
+        // a real dir owned by the app user. `install -d` is idempotent for an
+        // existing real dir and creates it (mode 0755) if absent.
+        await check(await run('sudo', ['test', '!', '-L', current]), `symlink-guard ${current}`);
+        await check(await run('sudo', ['install', '-d', '-o', user, '-g', user, '-m', '755', current]), `mkdir ${current}`);
+      }
+      // 2. Stage content into an agent-owned temp file (0644 so nothing sensitive
+      //    lingers world-readable is moot — content is public build output — but
+      //    root reads it regardless), then install it to the exact target with
+      //    -T (no parent creation) and app-user ownership.
+      const tmp = join(tmpdir(), `archon-deploy-${process.pid}-${stagingId()}`);
+      await fs.writeFile(tmp, content, { mode: 0o644 });
+      try {
+        await check(
+          await run('sudo', ['install', '-T', '-o', user, '-g', user, '-m', '644', tmp, abs]),
+          `install ${abs}`,
+        );
+      } finally {
+        await fs.rm(tmp, { force: true }).catch(() => {});
+      }
+    },
+    async remove(abs) {
+      await check(await run('sudo', ['rm', '-f', abs]), `rm ${abs}`);
+    },
+  };
+}
+
+// Per-file staging-path suffix. Uses randomUUID (collision-free even under a
+// hypothetical concurrent caller) plus a monotonic counter for readability.
+let stagingCounter = 0;
+function stagingId(): string {
+  stagingCounter += 1;
+  return `${stagingCounter}-${randomUUID()}`;
+}
 
 /**
  * Refuse to write through a symlink.
@@ -95,29 +210,26 @@ async function assertNoSymlinkInChain(appRoot: string, relPath: string): Promise
 }
 
 export async function applyDiff(
-  appRoot: string, input: DiffInput, owner: { uid: number; gid: number },
+  appRoot: string, input: DiffInput, ops: FileOps,
 ): Promise<{ written: number; deleted: number }> {
   let written = 0, deleted = 0;
   for (const f of input.files) {
     const abs = join(appRoot, f.path);
     if (relative(appRoot, abs).startsWith('..')) throw new Error(`path escapes appRoot: ${f.path}`);
-    // Reject a symlink at ANY existing segment BEFORE mkdir -p can traverse
+    // Reject a symlink at ANY existing segment BEFORE any mutation can traverse
     // through it (see assertNoSymlinkInChain). Covers the immediate parent and
-    // the leaf target too.
+    // the leaf target too. These lstat checks are read-only and run as the agent
+    // regardless of how `ops` performs the write — so a symlink can never be
+    // followed even when the privileged (sudo) write would otherwise honor it.
     await assertNoSymlinkInChain(appRoot, f.path);
-    const parentDir = join(abs, '..');
-    await fs.mkdir(parentDir, { recursive: true });
-    // Re-check the leaf after mkdir: the parent now exists as a real dir, and
-    // the leaf may have been created by a concurrent path — cheap belt-and-braces.
     await assertNotSymlink(abs, f.path);
-    await fs.writeFile(abs, Buffer.from(f.content, 'base64'));
-    await fs.chown(abs, owner.uid, owner.gid).catch(() => {});
+    await ops.writeFile(appRoot, f.path, abs, Buffer.from(f.content, 'base64'));
     written++;
   }
   for (const d of input.deletions) {
     const abs = join(appRoot, d);
     if (relative(appRoot, abs).startsWith('..')) throw new Error(`path escapes appRoot: ${d}`);
-    await fs.rm(abs, { force: true }); deleted++;
+    await ops.remove(abs); deleted++;
   }
   return { written, deleted };
 }

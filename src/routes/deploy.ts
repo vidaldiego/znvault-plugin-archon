@@ -31,37 +31,6 @@ interface ChunkBody {
   commit?: boolean;
 }
 
-// uid/gid for cfg.user, resolved once (via `id -u`/`id -g`) and cached per
-// username — it can't change without a re-provision, so there's no reason
-// to shell out on every deploy. Falls back to 0/0 (root) only if resolution
-// fails, matching applyDiff's existing "chown failure is non-fatal" stance
-// (fs.chown errors are caught there) rather than blocking the deploy.
-const ownerCache = new Map<string, { uid: number; gid: number }>();
-async function resolveOwner(user: string): Promise<{ uid: number; gid: number }> {
-  const cached = ownerCache.get(user);
-  if (cached) return cached;
-  try {
-    const [uidRes, gidRes] = await Promise.all([
-      runCommand('id', ['-u', user], '/'),
-      runCommand('id', ['-g', user], '/'),
-    ]);
-    const uid = Number.parseInt(uidRes.stdout.trim(), 10);
-    const gid = Number.parseInt(gidRes.stdout.trim(), 10);
-    if (!Number.isFinite(uid) || !Number.isFinite(gid)) {
-      throw new Error(`could not parse uid/gid for user '${user}' (got uid='${uidRes.stdout.trim()}' gid='${gidRes.stdout.trim()}')`);
-    }
-    const owner = { uid, gid };
-    ownerCache.set(user, owner);
-    return owner;
-  } catch (e) {
-    // Fail LOUDLY, do NOT silently fall back to root (uid 0). Chowning deploy
-    // files to root would break the archon service's access to its own files
-    // and be undiagnosable. Throwing here surfaces as a 500 with the journal
-    // left open (recoverable), consistent with how npm ci/prisma generate
-    // failures are handled in runPostApply.
-    throw new Error(`resolveOwner failed for user '${user}': ${e instanceof Error ? e.message : String(e)}`);
-  }
-}
 
 function isArray(v: unknown): v is unknown[] {
   return Array.isArray(v);
@@ -136,8 +105,9 @@ async function applyWithJournal(
   const deploymentId = randomUUID();
   journal.open?.({ deploymentId, filesChanged: files.length, filesDeleted: deletions.length });
 
-  const owner = await resolveOwner(cfg.user);
-  const applyResult = await differ.apply({ files, deletions }, owner);
+  // File writes/deletes run as cfg.user via sudo inside differ.apply (the app
+  // tree is owned by that user, not the agent) — no uid/gid resolution needed.
+  const applyResult = await differ.apply({ files, deletions });
   const postApply = await runPostApply(cfg, files);
 
   journal.close?.();

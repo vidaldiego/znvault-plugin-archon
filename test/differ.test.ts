@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { mkdtemp, mkdir, writeFile, readFile, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { hashManagedFiles, applyDiff } from '../src/differ.js';
+import { hashManagedFiles, applyDiff, makeDirectFileOps } from '../src/differ.js';
 
 describe('hashManagedFiles', () => {
   it('hashes dist files and excludes .map, is stable', async () => {
@@ -22,7 +22,7 @@ describe('hashManagedFiles', () => {
 });
 
 describe('applyDiff — path-traversal guard', () => {
-  const owner = { uid: 0, gid: 0 };
+  const owner = makeDirectFileOps({ uid: 0, gid: 0 });
 
   it('throws on a files[].path that escapes appRoot', async () => {
     const root = await mkdtemp(join(tmpdir(), 'archon-diff-'));

@@ -20,7 +20,7 @@ export interface ManagerLike {
 
 export interface DifferLike {
   hash(): Promise<unknown>;
-  apply(input: unknown, owner: { uid: number; gid: number }): Promise<{ written: number; deleted: number }>;
+  apply(input: unknown): Promise<{ written: number; deleted: number }>;
 }
 
 export interface JournalLike {
