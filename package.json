@@ -1,6 +1,6 @@
 {
   "name": "@zincapp/znvault-plugin-archon",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Archon deployment plugin for zn-vault-agent + znvault CLI (diff deploy, Prisma dynamic-secret migrations, service/reboot control)",
   "type": "module",
   "main": "dist/index.js",
