@@ -428,7 +428,14 @@ function registerDeployCommands(deployCmd: Command, ctx: CLIPluginContext, deps?
                   return { success: true, result: { success: true, filesChanged: 0, filesDeleted: 0, message: 'No changes', deploymentTime: 0, appName: rc.name } };
                 }
                 await agentPost(`${pluginUrl}/deploy`, payload);
-                ctx.output.success(`  [${rc.name}] ${host}: deployed (+${payload.files.length} -${payload.deletions.length})`);
+                // Restart the archon service so the new files actually run. WITHOUT
+                // this the deploy is a no-op on running code (new files on disk, old
+                // process still serving) — and for serving classes the subsequent
+                // health-gate would pass against the STALE process, masking it.
+                // Runs here (inside deployOneHost) so it happens while the node is
+                // drained (serving lifecycle) and before the health-gate.
+                await agentPost(`${pluginUrl}/restart`, {});
+                ctx.output.success(`  [${rc.name}] ${host}: deployed (+${payload.files.length} -${payload.deletions.length}) + restarted`);
                 return {
                   success: true,
                   result: { success: true, filesChanged: payload.files.length, filesDeleted: payload.deletions.length, message: 'Deployed', deploymentTime: 0, appName: rc.name },
