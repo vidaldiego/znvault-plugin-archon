@@ -609,11 +609,52 @@ function registerDeployCommands(deployCmd: Command, ctx: CLIPluginContext, deps?
 }
 
 /**
+ * Injectable tunnel primitives — real in production, mockable in tests.
+ * (openTunnel/setEndpointOverride/clearEndpointOverride shell out to SSH and
+ * mutate a module-global override map, so tests inject fakes.)
+ */
+export interface TunnelDeps {
+  openTunnel: typeof openTunnel;
+  setEndpointOverride: typeof setEndpointOverride;
+  clearEndpointOverride: typeof clearEndpointOverride;
+}
+const defaultTunnelDeps: TunnelDeps = { openTunnel, setEndpointOverride, clearEndpointOverride };
+
+/**
+ * Run `fn(pluginUrl)` against a single host's agent, opening an SSH-CA tunnel
+ * first UNLESS `noTunnel` is set. The agent binds 127.0.0.1:<port> (localhost
+ * only), so the standalone lifecycle/quiesce commands — like `deploy run` —
+ * MUST tunnel to reach it; calling the host directly always "fetch failed".
+ * The tunnel + endpoint override are always torn down (finally), even on throw.
+ */
+export async function withAgentTunnel<T>(
+  target: string,
+  port: number,
+  opts: { user?: string; noTunnel?: boolean },
+  fn: (pluginUrl: string) => Promise<T>,
+  deps: TunnelDeps = defaultTunnelDeps,
+): Promise<T> {
+  let tunnel: Tunnel | undefined;
+  try {
+    if (!opts.noTunnel) {
+      tunnel = await deps.openTunnel(target, { user: opts.user, remotePort: port });
+      deps.setEndpointOverride(target, '127.0.0.1', tunnel.localPort);
+    }
+    return await fn(archonPluginUrl(target, port));
+  } finally {
+    if (tunnel) {
+      deps.clearEndpointOverride(target);
+      await tunnel.close().catch(() => undefined);
+    }
+  }
+}
+
+/**
  * Register `znvault archon restart` and `znvault archon reboot`.
  * Single-host, direct-target commands (the plugin doesn't run a fleet-wide
  * rolling restart the way payara's canary rollout does — archon service
  * restarts are typically part of `deploy run`'s per-host apply, this is the
- * standalone escape hatch).
+ * standalone escape hatch). Each tunnels to the localhost-bound agent.
  */
 function registerLifecycleCommands(archon: Command, ctx: CLIPluginContext): void {
   archon
@@ -621,10 +662,12 @@ function registerLifecycleCommands(archon: Command, ctx: CLIPluginContext): void
     .description('Restart the archon service on a host')
     .requiredOption('-t, --target <host>', 'Target host')
     .option('-p, --port <port>', `Agent port (default: ${DEFAULT_PORT})`, String(DEFAULT_PORT))
-    .action(async (options: { target: string; port: string }) => {
-      const pluginUrl = archonPluginUrl(options.target, Number.parseInt(options.port, 10));
+    .option('-u, --user <user>', 'SSH user for the tunnel', 'sysadmin')
+    .option('--no-tunnel', 'Reach the agent directly (only if the agent port is network-reachable)')
+    .action(async (options: { target: string; port: string; user: string; tunnel: boolean }) => {
       try {
-        await agentPost(`${pluginUrl}/restart`, {});
+        await withAgentTunnel(options.target, Number.parseInt(options.port, 10), { user: options.user, noTunnel: !options.tunnel },
+          (pluginUrl) => agentPost(`${pluginUrl}/restart`, {}));
         ctx.output.success(`${options.target}: archon service restarted`);
       } catch (err) {
         ctx.output.error(`Restart failed: ${getErrorMessage(err)}`);
@@ -638,10 +681,12 @@ function registerLifecycleCommands(archon: Command, ctx: CLIPluginContext): void
     .requiredOption('-t, --target <host>', 'Target host')
     .requiredOption('--confirm <hostname>', 'Must exactly match the target host\'s own hostname (safety confirmation)')
     .option('-p, --port <port>', `Agent port (default: ${DEFAULT_PORT})`, String(DEFAULT_PORT))
-    .action(async (options: { target: string; confirm: string; port: string }) => {
-      const pluginUrl = archonPluginUrl(options.target, Number.parseInt(options.port, 10));
+    .option('-u, --user <user>', 'SSH user for the tunnel', 'sysadmin')
+    .option('--no-tunnel', 'Reach the agent directly (only if the agent port is network-reachable)')
+    .action(async (options: { target: string; confirm: string; port: string; user: string; tunnel: boolean }) => {
       try {
-        await agentPost(`${pluginUrl}/reboot`, { confirm: options.confirm });
+        await withAgentTunnel(options.target, Number.parseInt(options.port, 10), { user: options.user, noTunnel: !options.tunnel },
+          (pluginUrl) => agentPost(`${pluginUrl}/reboot`, { confirm: options.confirm }));
         ctx.output.success(`${options.target}: reboot accepted`);
       } catch (err) {
         ctx.output.error(`Reboot refused or failed: ${getErrorMessage(err)}`);
@@ -658,15 +703,19 @@ function registerLifecycleCommands(archon: Command, ctx: CLIPluginContext): void
  * surfaces whatever the agent reports.
  */
 function registerQuiesceCommands(quiesceCmd: Command, ctx: CLIPluginContext): void {
-  quiesceCmd
+  const tunnelOpts = (cmd: Command): Command => cmd
+    .option('-p, --port <port>', `Agent port (default: ${DEFAULT_PORT})`, String(DEFAULT_PORT))
+    .option('-u, --user <user>', 'SSH user for the tunnel', 'sysadmin')
+    .option('--no-tunnel', 'Reach the agent directly (only if the agent port is network-reachable)');
+
+  tunnelOpts(quiesceCmd
     .command('start')
     .description('Quiesce the scheduler on a host before a manual deploy')
-    .requiredOption('-t, --target <host>', 'Target host')
-    .option('-p, --port <port>', `Agent port (default: ${DEFAULT_PORT})`, String(DEFAULT_PORT))
-    .action(async (options: { target: string; port: string }) => {
-      const pluginUrl = archonPluginUrl(options.target, Number.parseInt(options.port, 10));
+    .requiredOption('-t, --target <host>', 'Target host'))
+    .action(async (options: { target: string; port: string; user: string; tunnel: boolean }) => {
       try {
-        const body = await agentPost<{ status?: string; reason?: string; inFlightUnits?: number }>(`${pluginUrl}/quiesce`, {});
+        const body = await withAgentTunnel(options.target, Number.parseInt(options.port, 10), { user: options.user, noTunnel: !options.tunnel },
+          (pluginUrl) => agentPost<{ status?: string; reason?: string; inFlightUnits?: number }>(`${pluginUrl}/quiesce`, {}));
         if (body.status === 'noop') {
           ctx.output.warn(`${options.target}: quiesce not available (${body.reason})`);
         } else {
@@ -678,15 +727,14 @@ function registerQuiesceCommands(quiesceCmd: Command, ctx: CLIPluginContext): vo
       }
     });
 
-  quiesceCmd
+  tunnelOpts(quiesceCmd
     .command('resume')
     .description('Resume the scheduler on a host after a manual deploy')
-    .requiredOption('-t, --target <host>', 'Target host')
-    .option('-p, --port <port>', `Agent port (default: ${DEFAULT_PORT})`, String(DEFAULT_PORT))
-    .action(async (options: { target: string; port: string }) => {
-      const pluginUrl = archonPluginUrl(options.target, Number.parseInt(options.port, 10));
+    .requiredOption('-t, --target <host>', 'Target host'))
+    .action(async (options: { target: string; port: string; user: string; tunnel: boolean }) => {
       try {
-        await agentPost(`${pluginUrl}/resume`, {});
+        await withAgentTunnel(options.target, Number.parseInt(options.port, 10), { user: options.user, noTunnel: !options.tunnel },
+          (pluginUrl) => agentPost(`${pluginUrl}/resume`, {}));
         ctx.output.success(`${options.target}: resumed`);
       } catch (err) {
         ctx.output.error(`Resume failed: ${getErrorMessage(err)}`);
@@ -694,15 +742,14 @@ function registerQuiesceCommands(quiesceCmd: Command, ctx: CLIPluginContext): vo
       }
     });
 
-  quiesceCmd
+  tunnelOpts(quiesceCmd
     .command('status')
     .description('Check scheduler quiesce status on a host')
-    .requiredOption('-t, --target <host>', 'Target host')
-    .option('-p, --port <port>', `Agent port (default: ${DEFAULT_PORT})`, String(DEFAULT_PORT))
-    .action(async (options: { target: string; port: string }) => {
-      const pluginUrl = archonPluginUrl(options.target, Number.parseInt(options.port, 10));
+    .requiredOption('-t, --target <host>', 'Target host'))
+    .action(async (options: { target: string; port: string; user: string; tunnel: boolean }) => {
       try {
-        const body = await agentGet<{ status?: string; quiesced?: boolean; inFlightUnits?: number; reason?: string }>(`${pluginUrl}/quiesce/status`);
+        const body = await withAgentTunnel(options.target, Number.parseInt(options.port, 10), { user: options.user, noTunnel: !options.tunnel },
+          (pluginUrl) => agentGet<{ status?: string; quiesced?: boolean; inFlightUnits?: number; reason?: string }>(`${pluginUrl}/quiesce/status`));
         if (body.status === 'noop') {
           ctx.output.warn(`${options.target}: status not available (${body.reason})`);
         } else {
