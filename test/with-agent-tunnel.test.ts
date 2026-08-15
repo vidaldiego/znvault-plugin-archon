@@ -16,14 +16,14 @@ describe('withAgentTunnel', () => {
     const { deps, close } = fakeDeps();
     const fn = vi.fn().mockResolvedValue('result');
 
-    const out = await withAgentTunnel('172.16.211.55', 9100, { user: 'sysadmin' }, fn, deps);
+    const out = await withAgentTunnel('192.0.2.55', 9100, { user: 'sysadmin' }, fn, deps);
 
     expect(out).toBe('result');
-    expect(deps.openTunnel).toHaveBeenCalledWith('172.16.211.55', { user: 'sysadmin', remotePort: 9100 });
-    expect(deps.setEndpointOverride).toHaveBeenCalledWith('172.16.211.55', '127.0.0.1', 45123);
+    expect(deps.openTunnel).toHaveBeenCalledWith('192.0.2.55', { user: 'sysadmin', remotePort: 9100 });
+    expect(deps.setEndpointOverride).toHaveBeenCalledWith('192.0.2.55', '127.0.0.1', 45123);
     expect(fn).toHaveBeenCalledTimes(1);
     // cleanup in finally
-    expect(deps.clearEndpointOverride).toHaveBeenCalledWith('172.16.211.55');
+    expect(deps.clearEndpointOverride).toHaveBeenCalledWith('192.0.2.55');
     expect(close).toHaveBeenCalledTimes(1);
   });
 
@@ -31,8 +31,8 @@ describe('withAgentTunnel', () => {
     const { deps, close } = fakeDeps();
     const fn = vi.fn().mockRejectedValue(new Error('reboot refused'));
 
-    await expect(withAgentTunnel('172.16.211.55', 9100, {}, fn, deps)).rejects.toThrow('reboot refused');
-    expect(deps.clearEndpointOverride).toHaveBeenCalledWith('172.16.211.55');
+    await expect(withAgentTunnel('192.0.2.55', 9100, {}, fn, deps)).rejects.toThrow('reboot refused');
+    expect(deps.clearEndpointOverride).toHaveBeenCalledWith('192.0.2.55');
     expect(close).toHaveBeenCalledTimes(1);
   });
 
@@ -40,7 +40,7 @@ describe('withAgentTunnel', () => {
     const { deps, close } = fakeDeps();
     const fn = vi.fn().mockResolvedValue('ok');
 
-    await withAgentTunnel('172.16.211.55', 9100, { noTunnel: true }, fn, deps);
+    await withAgentTunnel('192.0.2.55', 9100, { noTunnel: true }, fn, deps);
 
     expect(deps.openTunnel).not.toHaveBeenCalled();
     expect(deps.setEndpointOverride).not.toHaveBeenCalled();

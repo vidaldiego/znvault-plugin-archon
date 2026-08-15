@@ -5,9 +5,9 @@ describe('composeEphemeralUrl', () => {
   it('percent-encodes user + password and pins sslmode=require, direct port', () => {
     const url = composeEphemeralUrl({
       leaseId: 'l', username: 'v-migrate-x/y', password: 'p@ss:w#rd',
-      host: '172.16.210.250', port: 5432, database: 'archon',
+      host: '203.0.113.250', port: 5432, database: 'archon',
     } as any);
-    expect(url).toBe('postgresql://v-migrate-x%2Fy:p%40ss%3Aw%23rd@172.16.210.250:5432/archon?sslmode=require');
+    expect(url).toBe('postgresql://v-migrate-x%2Fy:p%40ss%3Aw%23rd@203.0.113.250:5432/archon?sslmode=require');
   });
   it('throws when no database on lease and no override', () => {
     expect(() => composeEphemeralUrl({ leaseId: 'l', username: 'u', password: 'p', host: 'h', port: 5432 } as any))

@@ -86,17 +86,17 @@ const apiConfig: DeployConfig = {
   classes: [
     {
       name: 'api',
-      hosts: ['172.16.220.55', '172.16.220.56'],
+      hosts: ['192.0.2.55', '192.0.2.56'],
       strategy: '1+R',
       haproxy: {
-        hosts: ['172.16.220.20'],
+        hosts: ['198.51.100.20'],
         backend: 'api_servers',
-        serverMap: { '172.16.220.55': 'api1', '172.16.220.56': 'api2' },
+        serverMap: { '192.0.2.55': 'api1', '192.0.2.56': 'api2' },
       },
     },
     {
       name: 'worker',
-      hosts: ['172.16.220.58'],
+      hosts: ['192.0.2.58'],
     },
   ],
 };
@@ -132,7 +132,7 @@ describe('deploy run — canary rollout + HAProxy drain', () => {
     expect(executeStrategyMock).toHaveBeenCalledTimes(1);
     const [strategyArg, hostsArg] = executeStrategyMock.mock.calls[0]!;
     expect(strategyArg).toMatchObject({ name: '1+R', isCanary: true });
-    expect(hostsArg).toEqual(['172.16.220.55', '172.16.220.56']);
+    expect(hostsArg).toEqual(['192.0.2.55', '192.0.2.56']);
   });
 
   it('drains before deploy and readies after, for every host in the serving class', async () => {
@@ -148,7 +148,7 @@ describe('deploy run — canary rollout + HAProxy drain', () => {
 
     expect(drainServerMock).toHaveBeenCalledTimes(2);
     expect(readyServerMock).toHaveBeenCalledTimes(2);
-    for (const host of ['172.16.220.55', '172.16.220.56']) {
+    for (const host of ['192.0.2.55', '192.0.2.56']) {
       expect(drainServerMock).toHaveBeenCalledWith(apiConfig.classes![0]!.haproxy, host);
       expect(readyServerMock).toHaveBeenCalledWith(apiConfig.classes![0]!.haproxy, host);
     }
@@ -191,8 +191,8 @@ describe('deploy run — canary rollout + HAProxy drain', () => {
     expect(drainServerMock).toHaveBeenCalledTimes(2);
     // readyServer must STILL be called for the failed host (via `finally`), plus the healthy one.
     expect(readyServerMock).toHaveBeenCalledTimes(2);
-    expect(readyServerMock).toHaveBeenCalledWith(apiConfig.classes![0]!.haproxy, '172.16.220.55');
-    expect(readyServerMock).toHaveBeenCalledWith(apiConfig.classes![0]!.haproxy, '172.16.220.56');
+    expect(readyServerMock).toHaveBeenCalledWith(apiConfig.classes![0]!.haproxy, '192.0.2.55');
+    expect(readyServerMock).toHaveBeenCalledWith(apiConfig.classes![0]!.haproxy, '192.0.2.56');
   });
 
   it('does NOT call drainServer/readyServer for a worker class with no haproxy config', async () => {
@@ -204,7 +204,7 @@ describe('deploy run — canary rollout + HAProxy drain', () => {
     expect(readyServerMock).not.toHaveBeenCalled();
     // Worker class deploys directly (bare sequential loop), not via executeStrategy.
     expect(executeStrategyMock).not.toHaveBeenCalled();
-    expect(agentPostMock).toHaveBeenCalledWith(expect.stringContaining('172.16.220.58'), expect.anything());
+    expect(agentPostMock).toHaveBeenCalledWith(expect.stringContaining('192.0.2.58'), expect.anything());
   });
 
   it('--skip-drain forces the api class through the bare (no-drain) worker-style path', async () => {
