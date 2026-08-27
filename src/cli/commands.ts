@@ -68,6 +68,28 @@ const DEFAULT_PORT = 9100;
 // false failure while the node is actually restarting successfully.
 const RESTART_TIMEOUT_MS = 5 * 60_000;
 
+const QUIESCE_POLL_MS = 2_000;
+const QUIESCE_DRAIN_TIMEOUT_MS = 120_000;
+
+interface ArchonQuiesceState {
+  status?: string;
+  reason?: string;
+  quiesced?: boolean;
+  /** Current Archon health-probe contract. */
+  activeJobs?: number;
+  /** Compatibility with the original deploy-core scheduler contract. */
+  inFlightUnits?: number;
+}
+
+function activeJobCount(state: ArchonQuiesceState): number | undefined {
+  const value = state.activeJobs ?? state.inFlightUnits;
+  return Number.isInteger(value) && value! >= 0 ? value : undefined;
+}
+
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
  * Where archon's saved deploy configs live on disk. Archon is a greenfield
  * plugin (no pre-v2 shared config location to migrate from), so
@@ -454,6 +476,93 @@ function registerDeployCommands(deployCmd: Command, ctx: CLIPluginContext, deps?
               }
             };
 
+            /**
+             * Fail-closed Archon self-update ceremony for a single host:
+             * quiesce -> wait for activeJobs=0 -> lifecycle -> resume.
+             *
+             * The resume attempt lives in `finally`, including timeout, deploy,
+             * restart and health-check failures. A configured ceremony never
+             * silently degrades to the plugin route's legacy `status: noop`.
+             */
+            const withQuiesce = async (
+              host: string,
+              lifecycle: () => Promise<DeployToHostResult>,
+            ): Promise<DeployToHostResult> => {
+              if (!rc.quiesce?.enabled) return lifecycle();
+
+              const pluginUrl = archonPluginUrl(host, port);
+              const pollMs = rc.quiesce.pollMs ?? QUIESCE_POLL_MS;
+              const timeoutMs = rc.hostConfigs?.[host]?.quiesceTimeoutMs
+                ?? rc.quiesce.drainTimeoutMs
+                ?? QUIESCE_DRAIN_TIMEOUT_MS;
+              let resumeRequired = false;
+              let result: DeployToHostResult;
+
+              try {
+                // Set before the request: a response timeout can still mean the
+                // remote side applied quiesce, so resume remains necessary.
+                resumeRequired = true;
+                let state = await agentPost<ArchonQuiesceState>(`${pluginUrl}/quiesce`, {});
+                if (state.status === 'noop') {
+                  throw new Error(`quiesce unavailable (${state.reason ?? 'unknown reason'})`);
+                }
+                if (state.quiesced !== true) {
+                  throw new Error('quiesce was not acknowledged by Archon');
+                }
+
+                const deadline = Date.now() + timeoutMs;
+                let jobs = activeJobCount(state);
+                if (jobs === undefined) {
+                  throw new Error('quiesce response did not include a valid activeJobs count');
+                }
+
+                while (jobs > 0) {
+                  const remaining = deadline - Date.now();
+                  if (remaining <= 0) {
+                    throw new Error(`quiesce drain timed out after ${timeoutMs}ms (${jobs} active job(s))`);
+                  }
+                  await wait(Math.min(pollMs, remaining));
+                  state = await agentGet<ArchonQuiesceState>(`${pluginUrl}/quiesce/status`);
+                  if (state.status === 'noop') {
+                    throw new Error(`quiesce status unavailable (${state.reason ?? 'unknown reason'})`);
+                  }
+                  if (state.quiesced !== true) {
+                    throw new Error('Archon left quiesced state before the drain completed');
+                  }
+                  jobs = activeJobCount(state);
+                  if (jobs === undefined) {
+                    throw new Error('quiesce status did not include a valid activeJobs count');
+                  }
+                }
+
+                ctx.output.info(`  [${rc.name}] ${host}: quiesced and drained`);
+                result = await lifecycle();
+              } catch (err) {
+                const message = `quiesce ceremony failed: ${getErrorMessage(err)}`;
+                ctx.output.error(`  [${rc.name}] ${host}: ${message}`);
+                result = { success: false, error: message };
+              } finally {
+                if (resumeRequired) {
+                  try {
+                    const resumed = await agentPost<ArchonQuiesceState>(`${pluginUrl}/resume`, {});
+                    if (resumed.status === 'noop') {
+                      const message = `resume failed after quiesce: resume unavailable (${resumed.reason ?? 'unknown reason'})`;
+                      ctx.output.error(`  [${rc.name}] ${host}: ${message}`);
+                      result = { success: false, error: message };
+                    } else {
+                      ctx.output.info(`  [${rc.name}] ${host}: resumed`);
+                    }
+                  } catch (err) {
+                    const message = `resume failed after quiesce: ${getErrorMessage(err)}`;
+                    ctx.output.error(`  [${rc.name}] ${host}: ${message}`);
+                    result = { success: false, error: message };
+                  }
+                }
+              }
+
+              return result!;
+            };
+
             const isServing = hasActiveServerMap(rc.haproxy) && !options.skipDrain;
             const failed = 0;
             let successful = 0, healthCheckFailed = 0;
@@ -461,7 +570,7 @@ function registerDeployCommands(deployCmd: Command, ctx: CLIPluginContext, deps?
 
             if (isServing) {
               // ── serving class: drain → deploy → health-gate → ready (finally re-readies on failure) ──
-              const lifecycle = async (host: string): Promise<DeployToHostResult> => {
+              const servingLifecycle = async (host: string): Promise<DeployToHostResult> => {
                 let drained = false;
                 try {
                   try {
@@ -506,6 +615,8 @@ function registerDeployCommands(deployCmd: Command, ctx: CLIPluginContext, deps?
                 }
               };
 
+              const lifecycle = (host: string) => withQuiesce(host, () => servingLifecycle(host));
+
               // deploy-vs-health failure disambiguation for reporting: a host that
               // fails its health check still lands in strategyResult.failed (its
               // lifecycle fn returned success:false), so healthCheckFailed is
@@ -537,25 +648,31 @@ function registerDeployCommands(deployCmd: Command, ctx: CLIPluginContext, deps?
             // the multi-class blocking gate (§3.3 — gate excludes workerFailed).
             let workerFailed = 0;
             for (const host of rc.hosts) {
-              const deployResult = await deployOneHost(host);
+              const workerLifecycle = async (): Promise<DeployToHostResult> => {
+                const deployResult = await deployOneHost(host);
+                if (!deployResult.success) return deployResult;
+                if (rc.healthCheck) {
+                  const healthResult = await performHealthCheck(host, rc.healthCheck, (attempt, maxAttempts, status, error) => {
+                    if (error) {
+                      ctx.output.info(`  [${rc.name}] ${host}: health check ${attempt}/${maxAttempts}: ${error}`);
+                    } else if (status !== undefined) {
+                      ctx.output.info(`  [${rc.name}] ${host}: health check ${attempt}/${maxAttempts}: HTTP ${status}`);
+                    }
+                  });
+                  if (!healthResult.success) {
+                    const message = `worker unhealthy (non-blocking): ${healthResult.error ?? `HTTP ${healthResult.status}`}`;
+                    ctx.output.warn(`  [${rc.name}] ${host}: ${message}`);
+                    return { success: false, error: message };
+                  }
+                }
+                return deployResult;
+              };
+
+              const deployResult = await withQuiesce(host, workerLifecycle);
               results.set(host, deployResult);
               if (!deployResult.success) {
                 workerFailed++;
                 continue;
-              }
-              if (rc.healthCheck) {
-                const healthResult = await performHealthCheck(host, rc.healthCheck, (attempt, maxAttempts, status, error) => {
-                  if (error) {
-                    ctx.output.info(`  [${rc.name}] ${host}: health check ${attempt}/${maxAttempts}: ${error}`);
-                  } else if (status !== undefined) {
-                    ctx.output.info(`  [${rc.name}] ${host}: health check ${attempt}/${maxAttempts}: HTTP ${status}`);
-                  }
-                });
-                if (!healthResult.success) {
-                  ctx.output.warn(`  [${rc.name}] ${host}: worker unhealthy (non-blocking): ${healthResult.error ?? `HTTP ${healthResult.status}`}`);
-                  workerFailed++;
-                  continue;
-                }
               }
               successful++;
             }
@@ -729,11 +846,11 @@ function registerQuiesceCommands(quiesceCmd: Command, ctx: CLIPluginContext): vo
     .action(async (options: { target: string; port: string; user: string; tunnel: boolean }) => {
       try {
         const body = await withAgentTunnel(options.target, Number.parseInt(options.port, 10), { user: options.user, noTunnel: !options.tunnel },
-          (pluginUrl) => agentPost<{ status?: string; reason?: string; inFlightUnits?: number }>(`${pluginUrl}/quiesce`, {}));
+          (pluginUrl) => agentPost<ArchonQuiesceState>(`${pluginUrl}/quiesce`, {}));
         if (body.status === 'noop') {
           ctx.output.warn(`${options.target}: quiesce not available (${body.reason})`);
         } else {
-          ctx.output.success(`${options.target}: quiesced (in-flight: ${body.inFlightUnits ?? 'unknown'})`);
+          ctx.output.success(`${options.target}: quiesced (active jobs: ${activeJobCount(body) ?? 'unknown'})`);
         }
       } catch (err) {
         ctx.output.error(`Quiesce failed: ${getErrorMessage(err)}`);
@@ -763,11 +880,11 @@ function registerQuiesceCommands(quiesceCmd: Command, ctx: CLIPluginContext): vo
     .action(async (options: { target: string; port: string; user: string; tunnel: boolean }) => {
       try {
         const body = await withAgentTunnel(options.target, Number.parseInt(options.port, 10), { user: options.user, noTunnel: !options.tunnel },
-          (pluginUrl) => agentGet<{ status?: string; quiesced?: boolean; inFlightUnits?: number; reason?: string }>(`${pluginUrl}/quiesce/status`));
+          (pluginUrl) => agentGet<ArchonQuiesceState>(`${pluginUrl}/quiesce/status`));
         if (body.status === 'noop') {
           ctx.output.warn(`${options.target}: status not available (${body.reason})`);
         } else {
-          ctx.output.keyValue({ quiesced: body.quiesced ?? false, inFlightUnits: body.inFlightUnits ?? 'unknown' });
+          ctx.output.keyValue({ quiesced: body.quiesced ?? false, activeJobs: activeJobCount(body) ?? 'unknown' });
         }
       } catch (err) {
         ctx.output.error(`Status check failed: ${getErrorMessage(err)}`);

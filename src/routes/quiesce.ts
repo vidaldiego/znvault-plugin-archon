@@ -6,11 +6,10 @@
 // (which is typically not exposed outside localhost).
 //
 // Not every Archon build has the quiesce endpoints (older builds, or nodes
-// running in a mode without a scheduler to drain). Rather than fail the
-// whole deploy pipeline over a 404/ECONNREFUSED from the app, this degrades
-// to a 200 no-op — quiesce-before-deploy is a best-effort safety net, not a
-// hard requirement, and a hard failure here would block deploys to any node
-// that predates the feature.
+// running in a mode without a scheduler to drain). The passthrough preserves
+// backwards compatibility by representing 404/ECONNREFUSED as `status: noop`.
+// The deploy CLI treats that result as a hard failure whenever a class has
+// quiesce.enabled=true; standalone commands may still report it as unavailable.
 
 import type { FastifyInstance } from 'fastify';
 import type { RouteContext } from './types.js';

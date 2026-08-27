@@ -101,6 +101,17 @@ const apiConfig: DeployConfig = {
   ],
 };
 
+const quiescedWorkerConfig: DeployConfig = {
+  ...apiConfig,
+  classes: [
+    apiConfig.classes![0]!,
+    {
+      ...apiConfig.classes![1]!,
+      quiesce: { enabled: true, pollMs: 1, drainTimeoutMs: 100 },
+    },
+  ],
+};
+
 describe('deploy run — canary rollout + HAProxy drain', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -221,5 +232,56 @@ describe('deploy run — canary rollout + HAProxy drain', () => {
     expect(readyServerMock).not.toHaveBeenCalled();
     expect(executeStrategyMock).not.toHaveBeenCalled();
     expect(testHAProxyConnectivityMock).not.toHaveBeenCalled();
+  });
+
+  it('runs the configured worker quiesce -> drain -> deploy/restart -> resume ceremony', async () => {
+    getConfigMock.mockResolvedValue(quiescedWorkerConfig);
+    let statusCalls = 0;
+    agentGetMock.mockImplementation(async (url: string) => {
+      if (url.endsWith('/quiesce/status')) {
+        statusCalls++;
+        return { quiesced: true, activeJobs: statusCalls === 1 ? 1 : 0 };
+      }
+      return { root: [{ path: 'stale-remote-only-file.txt', sha256: 'deadbeef' }] };
+    });
+    agentPostMock.mockImplementation(async (url: string) => {
+      if (url.endsWith('/quiesce')) return { quiesced: true, activeJobs: 2 };
+      return {};
+    });
+
+    const ctx = makeCtx();
+    const program = buildProgram(ctx);
+    await program.parseAsync(['node', 'znvault', 'archon', 'deploy', 'run', 'staging', '--class', 'worker']);
+
+    const calls = agentPostMock.mock.calls.map(([url]) => String(url));
+    const quiesceAt = calls.findIndex((url) => url.endsWith('/quiesce'));
+    const deployAt = calls.findIndex((url) => url.endsWith('/deploy'));
+    const restartAt = calls.findIndex((url) => url.endsWith('/restart'));
+    const resumeAt = calls.findIndex((url) => url.endsWith('/resume'));
+    expect(quiesceAt).toBeGreaterThanOrEqual(0);
+    expect(quiesceAt).toBeLessThan(deployAt);
+    expect(deployAt).toBeLessThan(restartAt);
+    expect(restartAt).toBeLessThan(resumeAt);
+    expect(statusCalls).toBe(2);
+    expect(ctx.output.info).toHaveBeenCalledWith(expect.stringContaining('quiesced and drained'));
+    expect(ctx.output.info).toHaveBeenCalledWith(expect.stringContaining('resumed'));
+  });
+
+  it('fails closed and resumes when configured quiesce is unavailable', async () => {
+    getConfigMock.mockResolvedValue(quiescedWorkerConfig);
+    agentPostMock.mockImplementation(async (url: string) => {
+      if (url.endsWith('/quiesce')) return { status: 'noop', reason: 'not_found' };
+      return {};
+    });
+
+    const ctx = makeCtx();
+    const program = buildProgram(ctx);
+    await program.parseAsync(['node', 'znvault', 'archon', 'deploy', 'run', 'staging', '--class', 'worker']);
+
+    const calls = agentPostMock.mock.calls.map(([url]) => String(url));
+    expect(calls.some((url) => url.endsWith('/deploy'))).toBe(false);
+    expect(calls.some((url) => url.endsWith('/restart'))).toBe(false);
+    expect(calls.some((url) => url.endsWith('/resume'))).toBe(true);
+    expect(ctx.output.error).toHaveBeenCalledWith(expect.stringContaining('quiesce unavailable (not_found)'));
   });
 });
