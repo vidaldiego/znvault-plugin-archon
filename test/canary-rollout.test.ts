@@ -205,6 +205,11 @@ describe('deploy run — canary rollout + HAProxy drain', () => {
     // Worker class deploys directly (bare sequential loop), not via executeStrategy.
     expect(executeStrategyMock).not.toHaveBeenCalled();
     expect(agentPostMock).toHaveBeenCalledWith(expect.stringContaining('192.0.2.58'), expect.anything());
+    expect(agentPostMock).toHaveBeenCalledWith(
+      expect.stringContaining('/restart'),
+      {},
+      300_000,
+    );
   });
 
   it('--skip-drain forces the api class through the bare (no-drain) worker-style path', async () => {

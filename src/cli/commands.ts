@@ -61,6 +61,13 @@ const PLUGIN_NAMESPACE = 'archon';
 /** Default agent HTTP port (matches the agent's default plugin bind port). */
 const DEFAULT_PORT = 9100;
 
+// Archon's restart endpoint waits for systemd to complete the restart and for
+// the service manager to return. Production restarts legitimately exceed the
+// deploy-core quick-call default (30s), especially after migrations. Treat the
+// restart as a deployment lifecycle operation so the CLI does not report a
+// false failure while the node is actually restarting successfully.
+const RESTART_TIMEOUT_MS = 5 * 60_000;
+
 /**
  * Where archon's saved deploy configs live on disk. Archon is a greenfield
  * plugin (no pre-v2 shared config location to migrate from), so
@@ -434,7 +441,7 @@ function registerDeployCommands(deployCmd: Command, ctx: CLIPluginContext, deps?
                 // health-gate would pass against the STALE process, masking it.
                 // Runs here (inside deployOneHost) so it happens while the node is
                 // drained (serving lifecycle) and before the health-gate.
-                await agentPost(`${pluginUrl}/restart`, {});
+                await agentPost(`${pluginUrl}/restart`, {}, RESTART_TIMEOUT_MS);
                 ctx.output.success(`  [${rc.name}] ${host}: deployed (+${payload.files.length} -${payload.deletions.length}) + restarted`);
                 return {
                   success: true,
@@ -674,7 +681,7 @@ function registerLifecycleCommands(archon: Command, ctx: CLIPluginContext): void
     .action(async (options: { target: string; port: string; user: string; tunnel: boolean }) => {
       try {
         await withAgentTunnel(options.target, Number.parseInt(options.port, 10), { user: options.user, noTunnel: !options.tunnel },
-          (pluginUrl) => agentPost(`${pluginUrl}/restart`, {}));
+          (pluginUrl) => agentPost(`${pluginUrl}/restart`, {}, RESTART_TIMEOUT_MS));
         ctx.output.success(`${options.target}: archon service restarted`);
       } catch (err) {
         ctx.output.error(`Restart failed: ${getErrorMessage(err)}`);
