@@ -23,6 +23,8 @@ const {
   getUnmappedHostsMock,
   agentGetMock,
   agentPostMock,
+  openTunnelMock,
+  closeTunnelMock,
   getConfigMock,
 } = vi.hoisted(() => ({
   executeStrategyMock: vi.fn(),
@@ -33,6 +35,8 @@ const {
   getUnmappedHostsMock: vi.fn(),
   agentGetMock: vi.fn(),
   agentPostMock: vi.fn(),
+  openTunnelMock: vi.fn(),
+  closeTunnelMock: vi.fn(),
   getConfigMock: vi.fn(),
 }));
 
@@ -43,6 +47,7 @@ vi.mock('@zincapp/znvault-deploy-core', async () => {
     getConfig: getConfigMock,
     agentGet: agentGetMock,
     agentPost: agentPostMock,
+    openTunnel: openTunnelMock,
     executeStrategy: executeStrategyMock,
     drainServer: drainServerMock,
     readyServer: readyServerMock,
@@ -122,6 +127,8 @@ describe('deploy run — canary rollout + HAProxy drain', () => {
     // (if anything) is actually on disk at rootDir in the test environment.
     agentGetMock.mockResolvedValue({ root: [{ path: 'stale-remote-only-file.txt', sha256: 'deadbeef' }] });
     agentPostMock.mockResolvedValue({});
+    closeTunnelMock.mockResolvedValue(undefined);
+    openTunnelMock.mockResolvedValue({ host: '192.0.2.58', localPort: 49123, close: closeTunnelMock });
     testHAProxyConnectivityMock.mockResolvedValue({ success: true, results: [] });
     getUnmappedHostsMock.mockReturnValue([]);
     drainServerMock.mockResolvedValue({ success: true, results: [] });
@@ -283,5 +290,22 @@ describe('deploy run — canary rollout + HAProxy drain', () => {
     expect(calls.some((url) => url.endsWith('/restart'))).toBe(false);
     expect(calls.some((url) => url.endsWith('/resume'))).toBe(true);
     expect(ctx.output.error).toHaveBeenCalledWith(expect.stringContaining('quiesce unavailable (not_found)'));
+  });
+
+  it('opens and tears down the configured SSH tunnel for deploy hashes', async () => {
+    getConfigMock.mockResolvedValue({ ...apiConfig, tunnel: true, ssh: { user: 'sysadmin' } }); // gitleaks:allow reason=test-only documented default SSH account, not a credential
+
+    const ctx = makeCtx();
+    const program = buildProgram(ctx);
+    await program.parseAsync(['node', 'znvault', 'archon', 'deploy', 'hashes', 'staging', '--class', 'worker']);
+
+    expect(openTunnelMock).toHaveBeenCalledWith('192.0.2.58', {
+      user: 'sysadmin', // gitleaks:allow reason=test-only documented default SSH account, not a credential
+      remotePort: 9100,
+      readinessTimeoutMs: undefined,
+    });
+    expect(agentGetMock).toHaveBeenCalledWith('http://127.0.0.1:49123/plugins/archon/hashes');
+    expect(closeTunnelMock).toHaveBeenCalledTimes(1);
+    expect(ctx.output.info).toHaveBeenCalledWith(expect.stringContaining('[worker] 192.0.2.58:'));
   });
 });

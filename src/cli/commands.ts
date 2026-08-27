@@ -431,7 +431,7 @@ function registerDeployCommands(deployCmd: Command, ctx: CLIPluginContext, deps?
           const port = rc.port ?? DEFAULT_PORT;
           const classTunnels: Tunnel[] = [];
           try {
-            if (config.tunnel) {
+            if (rc.tunnel) {
               for (const host of rc.hosts) {
                 try {
                   const t = await openTunnel(host, { user: config.ssh?.user, remotePort: port, readinessTimeoutMs: config.ssh?.readinessTimeoutMs });
@@ -726,13 +726,26 @@ function registerDeployCommands(deployCmd: Command, ctx: CLIPluginContext, deps?
         const rc = resolveClass(config, cls);
         const port = rc.port ?? DEFAULT_PORT;
         for (const host of rc.hosts) {
-          const pluginUrl = archonPluginUrl(host, port);
-          const getJson = (url: string) => agentGet<RemoteHashManifest>(url);
+          let tunnel: Tunnel | undefined;
           try {
+            if (rc.tunnel) {
+              tunnel = await openTunnel(host, {
+                user: rc.ssh?.user,
+                remotePort: port,
+                readinessTimeoutMs: rc.ssh?.readinessTimeoutMs,
+              });
+              setEndpointOverride(host, '127.0.0.1', tunnel.localPort);
+            }
+
+            const pluginUrl = archonPluginUrl(host, port);
+            const getJson = (url: string) => agentGet<RemoteHashManifest>(url);
             const { plan } = await computeDeployPlan(projectPath, rc.name, pluginUrl, getJson);
             ctx.output.info(`[${rc.name}] ${host}: +${plan.changed.length} changed, -${plan.deleted.length} deleted`);
           } catch (err) {
             ctx.output.error(`[${rc.name}] ${host}: ${getErrorMessage(err)}`);
+          } finally {
+            clearEndpointOverride(host);
+            await tunnel?.close().catch(() => undefined);
           }
         }
       }
