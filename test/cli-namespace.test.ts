@@ -10,5 +10,7 @@ describe('archon CLI namespace', () => {
     expect(archon).toBeTruthy();
     const subs = archon!.commands.map((c) => c.name());
     for (const s of ['deploy', 'restart', 'reboot', 'config', 'quiesce']) expect(subs).toContain(s);
+    const deploy = archon!.commands.find((c) => c.name() === 'deploy');
+    expect(deploy!.commands.map((c) => c.name())).toContain('credential-check');
   });
 });

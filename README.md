@@ -31,6 +31,7 @@ Peer: `@zincapp/zn-vault-agent`. Requires Node ≥ 20.
 ```bash
 znvault archon config create production --hosts … --root <checkout>   # then hand-edit the multi-class config
 znvault archon config validate production
+znvault archon deploy credential-check production                    # mint + strict revoke; no migrations
 znvault archon deploy run production [--dry-run|--class …|--pre-only|--skip-migrations|--skip-drain]
 znvault archon deploy hashes production                               # preview the diff, no changes
 znvault archon restart --target <host>
@@ -53,6 +54,13 @@ block with the dynamic-secrets `roleId`.
   created segment-by-segment with a symlink guard.
 - **Restart after deploy.** A changed host is restarted (for serving nodes,
   while drained and before the health-gate) so the new code actually runs.
+- **PostgreSQL ownership handoff.** Migration leases use a canonical
+  `CREATE ROLE` + `GRANT archon` lifecycle, while the Prisma connection starts
+  with `role=archon`. New DDL is therefore owned by the standing application
+  role and the ephemeral role can be dropped cleanly.
+- **Pre-tag credential proof.** `deploy credential-check` creates and strictly
+  revokes one short-lived migration credential without printing it or running
+  Prisma. A failed cleanup is a hard failure.
 - **Tunneled lifecycle.** `restart`/`reboot`/`quiesce` open an SSH-CA tunnel to
   the loopback-bound agent (`127.0.0.1:9100`).
 

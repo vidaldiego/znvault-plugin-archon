@@ -52,7 +52,11 @@ import {
   hasActiveServerMap,
 } from '@zincapp/znvault-deploy-core';
 import { getErrorMessage } from '../utils/error.js';
-import { makeArchonRunPhase, type RunnerDeps } from './migration-runner.js';
+import {
+  makeArchonRunPhase,
+  probeArchonMigrationCredential,
+  type RunnerDeps,
+} from './migration-runner.js';
 import { computeDeployPlan, type RemoteHashManifest } from './differ-client.js';
 
 /** Namespace archon registers its agent routes under: /plugins/archon/*. */
@@ -332,6 +336,29 @@ async function runArchonMigrationPhase(
  */
 function registerDeployCommands(deployCmd: Command, ctx: CLIPluginContext, deps?: DeployCommandDeps): void {
   const loc = archonConfigStoreLocation();
+
+  deployCmd
+    .command('credential-check <configName>')
+    .description('Mint and strictly revoke the configured migration credential without running migrations')
+    .action(async (configName: string) => {
+      const config = await getConfig(loc, configName);
+      if (!config) {
+        ctx.output.error(`Deployment config '${configName}' not found`);
+        process.exit(1);
+      }
+      if (!config.migration) {
+        ctx.output.error(`Credential check requires a pre-deploy migration config; none set on '${configName}'.`);
+        process.exit(1);
+      }
+
+      try {
+        await probeArchonMigrationCredential(ctx, config.migration.roleId, deps?.runPhaseDeps);
+        ctx.output.success(`[deploy] migration credential lifecycle verified (role '${config.migration.roleId}').`);
+      } catch (error) {
+        ctx.output.error(`[deploy] migration credential lifecycle failed: ${getErrorMessage(error)}`);
+        process.exit(1);
+      }
+    });
 
   deployCmd
     .command('run <configName>')

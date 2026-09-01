@@ -1,5 +1,9 @@
 import { describe, it, expect, vi } from 'vitest';
-import { composeEphemeralUrl, makeArchonRunPhase } from '../src/cli/migration-runner.js';
+import {
+  composeEphemeralUrl,
+  makeArchonRunPhase,
+  probeArchonMigrationCredential,
+} from '../src/cli/migration-runner.js';
 
 describe('composeEphemeralUrl', () => {
   it('percent-encodes user + password and pins sslmode=require, direct port', () => {
@@ -7,7 +11,7 @@ describe('composeEphemeralUrl', () => {
       leaseId: 'l', username: 'v-migrate-x/y', password: 'p@ss:w#rd',
       host: '203.0.113.250', port: 5432, database: 'archon',
     } as any);
-    expect(url).toBe('postgresql://v-migrate-x%2Fy:p%40ss%3Aw%23rd@203.0.113.250:5432/archon?sslmode=require');
+    expect(url).toBe('postgresql://v-migrate-x%2Fy:p%40ss%3Aw%23rd@203.0.113.250:5432/archon?sslmode=require&options=-c%20role%3Darchon');
   });
   it('throws when no database on lease and no override', () => {
     expect(() => composeEphemeralUrl({ leaseId: 'l', username: 'u', password: 'p', host: 'h', port: 5432 } as any))
@@ -36,9 +40,40 @@ describe('makeArchonRunPhase orchestration', () => {
     await runPhase({ roleId: 'dbr_x' } as any, 'pre-deploy', {} as any);
     expect(d.client.issueCredential).toHaveBeenCalledWith('dbr_x', { ttlSeconds: 14400 });
     expect(d.spawn.mock.calls[0][1]).toContain('deploy'); // prisma migrate deploy
-    expect(d.spawn.mock.calls[0][2].env.DATABASE_URL).toMatch(/^postgresql:\/\/u:p@h:5432\/archon\?sslmode=require$/);
+    expect(d.spawn.mock.calls[0][2].env.DATABASE_URL)
+      .toBe('postgresql://u:p@h:5432/archon?sslmode=require&options=-c%20role%3Darchon');
     expect(d.spawn.mock.calls[0][2].env.DIRECT_URL).toBe(d.spawn.mock.calls[0][2].env.DATABASE_URL);
     // revoke happens after child-exit, never before
     expect(d.events.indexOf('revoke')).toBeGreaterThan(d.events.indexOf('child-exit'));
+  });
+});
+
+describe('probeArchonMigrationCredential', () => {
+  const lease = { leaseId: 'L-probe', username: 'u', password: 'p', host: 'h', port: 5432, database: 'archon' };
+
+  it('mints a short lease and requires successful revocation without exposing the credential', async () => {
+    const client = {
+      issueCredential: vi.fn(async () => lease),
+      revokeCredential: vi.fn(async () => undefined),
+    };
+
+    await probeArchonMigrationCredential({ client: {} as any }, 'dbr_x', { client });
+
+    expect(client.issueCredential).toHaveBeenCalledWith('dbr_x', { ttlSeconds: 300 });
+    expect(client.revokeCredential).toHaveBeenCalledWith('L-probe', {
+      reason: 'archon migration credential preflight',
+    });
+  });
+
+  it('fails closed when strict revocation cannot be confirmed', async () => {
+    const client = {
+      issueCredential: vi.fn(async () => lease),
+      revokeCredential: vi.fn(async () => { throw new Error('drop refused'); }),
+    };
+
+    await expect(
+      probeArchonMigrationCredential({ client: {} as any }, 'dbr_x', { client }),
+    ).rejects.toThrow(/revocation failed: drop refused/);
+    expect(client.revokeCredential).toHaveBeenCalledTimes(3);
   });
 });

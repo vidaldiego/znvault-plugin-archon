@@ -14,6 +14,9 @@ import { makeVaultHttpAdapter, makeRevokeOnce, withTimeout, REVOKE_SETTLE_MS } f
  */
 
 const LEASE_TTL_SECONDS = 14400; // 4h — generous ceiling for a migrate deploy; revoked immediately after anyway.
+const CREDENTIAL_PROBE_TTL_SECONDS = 300;
+const ARCHON_SESSION_ROLE = 'archon';
+const STRICT_REVOKE_DELAYS_MS = [200, 600];
 
 /**
  * Build the direct (non-pooled) Postgres URL for an ephemeral lease.
@@ -34,7 +37,9 @@ export function composeEphemeralUrl(lease: Lease, dbOverride?: string): string {
   if (!db) throw new Error('no database name on lease and no override provided');
   const u = encodeURIComponent(lease.username);
   const p = encodeURIComponent(lease.password);
-  return `postgresql://${u}:${p}@${lease.host}:${lease.port}/${db}?sslmode=require`;
+  const database = encodeURIComponent(db);
+  const options = encodeURIComponent(`-c role=${ARCHON_SESSION_ROLE}`);
+  return `postgresql://${u}:${p}@${lease.host}:${lease.port}/${database}?sslmode=require&options=${options}`;
 }
 
 export interface RunnerDeps {
@@ -50,6 +55,59 @@ export interface RunnerDeps {
 export interface CLIPluginContext {
   client: { post<T>(p: string, b: unknown): Promise<T> };
   output?: { info?: (m: string) => void; warn?: (m: string) => void };
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function revokeCredentialStrict(
+  client: RunnerDeps['client'],
+  leaseId: string,
+): Promise<void> {
+  let lastError: unknown;
+  const attempts = 1 + STRICT_REVOKE_DELAYS_MS.length;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      await client.revokeCredential(leaseId, { reason: 'archon migration credential preflight' });
+      return;
+    } catch (error) {
+      lastError = error;
+      const delay = STRICT_REVOKE_DELAYS_MS[attempt];
+      if (delay !== undefined) await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+  throw new Error(`credential preflight revocation failed: ${errorMessage(lastError)}`);
+}
+
+/**
+ * Exercise the production migration role's complete target-side lifecycle
+ * without running Prisma or printing the returned credential. This is a
+ * deliberately mutating but self-cleaning pre-tag probe: Vault creates the
+ * ephemeral PostgreSQL role, this process validates the lease coordinates,
+ * and strict revocation must succeed before the command returns green.
+ */
+export async function probeArchonMigrationCredential(
+  ctx: CLIPluginContext,
+  roleId: string,
+  deps?: { client?: RunnerDeps['client'] },
+): Promise<void> {
+  const client = deps?.client ?? makeDynamicSecretsClient(makeVaultHttpAdapter(ctx.client));
+  const lease = await client.issueCredential(roleId, { ttlSeconds: CREDENTIAL_PROBE_TTL_SECONDS });
+  let validationError: unknown;
+
+  try {
+    // Build the exact URL shape used by Prisma. Never return or log it: it
+    // contains the short-lived password.
+    composeEphemeralUrl(lease);
+  } catch (error) {
+    validationError = error;
+  }
+
+  // A green preflight requires proven cleanup. Revocation errors therefore
+  // fail closed instead of using the migration runner's best-effort teardown.
+  await revokeCredentialStrict(client, lease.leaseId);
+  if (validationError !== undefined) throw validationError;
 }
 
 export type RunPhaseFn = (
