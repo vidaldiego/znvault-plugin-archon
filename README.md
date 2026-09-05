@@ -41,7 +41,7 @@ znvault archon quiesce start|status|resume --target <host>
 
 The config lives at `~/.znvault/archon/configs.json` (a flat `{ name: config }`
 map). A `production` config has an `api` class (1+R canary + HAProxy `haproxy`
-block) and a `workers` class (sequential, non-blocking), plus a `migration`
+block) and a `workers` class (sequential, non-blocking ordering), plus a `migration`
 block with the dynamic-secrets `roleId`.
 
 ## Key behaviors
@@ -54,6 +54,10 @@ block with the dynamic-secrets `roleId`.
   created segment-by-segment with a symlink guard.
 - **Restart after deploy.** A changed host is restarted (for serving nodes,
   while drained and before the health-gate) so the new code actually runs.
+- **Strict fleet result.** A non-blocking class continues through its remaining
+  hosts after one worker fails, but the final command exits non-zero and blocks
+  post-deploy migrations. HAProxy reachability and complete server mapping are
+  hard gates before the pre-deploy migration.
 - **PostgreSQL ownership handoff.** Migration leases use a canonical
   `CREATE ROLE` + `GRANT archon` lifecycle, while the Prisma connection starts
   with `role=archon`. New DDL is therefore owned by the standing application
@@ -79,4 +83,6 @@ npm run lint
 ```
 
 Releases publish to npm with provenance via OIDC trusted publishing on a
-`v*` tag push (`.github/workflows/publish.yml`).
+`v*` tag push (`.github/workflows/publish.yml`). Publication requires reusable
+CI, a tag/version/lockfile match at exact current `main`, one verified tarball
+and a digest check immediately before publishing. Manual dispatch is disabled.

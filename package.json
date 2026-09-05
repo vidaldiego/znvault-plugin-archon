@@ -20,7 +20,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "build:prod": "tsc --sourceMap false",
+    "build:prod": "npm run clean && tsc --sourceMap false --declarationMap false",
     "clean": "rm -rf dist",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",

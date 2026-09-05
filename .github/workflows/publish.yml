@@ -1,65 +1,82 @@
-name: Publish to npm
+name: Release
 
 on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch:
 
 permissions:
-  contents: write
-  id-token: write
+  contents: read
+
+concurrency:
+  group: archon-plugin-npm-publication
+  cancel-in-progress: false
 
 jobs:
+  validate:
+    uses: ./.github/workflows/ci.yml
+
   publish:
+    needs: validate
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
-
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        # Omit registry-url so npm Trusted Publishing uses GitHub OIDC rather
+        # than a generated classic-token stanza.
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '22'
-          # Do NOT pass `registry-url` here. setup-node writes a stub
-          # `_authToken=${NODE_AUTH_TOKEN}` line into .npmrc when this is
-          # set, which forces npm into classic Bearer-token auth and
-          # bypasses OIDC trusted publishing. With Trusted Publishers
-          # enabled on npm.com, npm picks up the GitHub OIDC token from
-          # ACTIONS_ID_TOKEN_REQUEST_URL/TOKEN automatically.
-
-      - name: Update npm for OIDC support
-        # OIDC Trusted Publishing requires npm >= 11.5.1. The 10.x line
-        # falls back to classic Bearer-token auth and returns ENEEDAUTH
-        # in this workflow. Pin to a known-good 11.x.
-        run: npm install -g npm@11.10.1
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build
-        run: npm run build
-
-      - name: Test
-        run: npm test
-
-      - name: Publish to npm (Trusted Publishing via OIDC)
-        # --loglevel=verbose forces npm to dump the full HTTP response
-        # body from the registry on failure. With Trusted Publishing,
-        # npm.com's 404 responses include a JSON body explaining which
-        # OIDC claim failed to match the configured publisher.
-        run: npm publish --access public --provenance --loglevel=verbose
+          cache: 'npm'
+      - name: Install OIDC-capable npm
+        run: npm install -g npm@11.17.0
+      - name: Verify release identity
+        run: node scripts/check-release.mjs "$GITHUB_REF_NAME"
+      - name: Install dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts
+      - name: Audit runtime dependencies
+        run: npm audit --omit=dev --audit-level=high
+      - name: Build production package
+        run: npm run build:prod
+      - name: Pack and verify the installable artifact
+        shell: bash
+        run: |
+          ARTIFACT_DIR="$RUNNER_TEMP/archon-plugin-release"
+          PACK_RESULT="$RUNNER_TEMP/archon-plugin-pack.json"
+          mkdir -p "$ARTIFACT_DIR"
+          npm pack --ignore-scripts --pack-destination "$ARTIFACT_DIR" --json > "$PACK_RESULT"
+          FILE=$(node -p "require(process.env.RUNNER_TEMP + '/archon-plugin-pack.json')[0].filename")
+          PACKAGE_PATH="$ARTIFACT_DIR/$FILE"
+          node scripts/verify-package.mjs "$PACKAGE_PATH" "${GITHUB_REF_NAME#v}"
+          sha256sum "$PACKAGE_PATH" > "$RUNNER_TEMP/archon-plugin-package.sha256"
+          printf 'PACKAGE_PATH=%s\n' "$PACKAGE_PATH" >> "$GITHUB_ENV"
+      - name: Preserve verified artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: archon-plugin-package-${{ github.ref_name }}
+          path: |
+            ${{ runner.temp }}/archon-plugin-release/*.tgz
+            ${{ runner.temp }}/archon-plugin-package.sha256
+          if-no-files-found: error
+      - name: Publish the verified tarball with OIDC
+        shell: bash
+        run: |
+          sha256sum --check "$RUNNER_TEMP/archon-plugin-package.sha256"
+          npm publish "$PACKAGE_PATH" --ignore-scripts --access public --provenance
 
   github-release:
     needs: publish
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
-
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           generate_release_notes: true
           draft: false

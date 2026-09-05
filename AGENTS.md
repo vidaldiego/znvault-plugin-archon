@@ -10,6 +10,10 @@ node_modules, machine-specific permissions or archived worktree .git pointers.
 Legacy sessions and experimental branches remain preserved in Codex-Recovery
 and External; historical plans are not deployment authorization.
 
+Package publication runs only from a version tag on exact current `main` after
+reusable CI. Build and verify one tarball, then publish that same digest. Do not
+restore manual dispatch or publish a separately rebuilt directory.
+
 During recovery, Git hooks and automatic GC remain locally disabled. The old
 Mutagen dev-sync stays paused and must not be resumed on these new clones.
 The organizational parent has no Git root or inherited core-agent settings.
