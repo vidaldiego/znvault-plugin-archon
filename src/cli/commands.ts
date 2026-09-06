@@ -413,10 +413,6 @@ function registerDeployCommands(deployCmd: Command, ctx: CLIPluginContext, deps?
           return;
         }
 
-        // ── pre-deploy migration phase (before any host is touched) ──
-        await runArchonMigrationPhase(config, 'pre-deploy', configName, ctx, projectPath,
-          { dryRun: options.dryRun, run: !options.skipMigrations }, deps);
-
         const classes: DeployClass[] = Array.isArray(config.classes) && config.classes.length > 0
           ? config.classes
           : [{ name: 'api', hosts: config.hosts ?? [] }];
@@ -425,34 +421,37 @@ function registerDeployCommands(deployCmd: Command, ctx: CLIPluginContext, deps?
         const resolved: ResolvedClass[] = selected.map((c) => resolveClass(config, c));
 
         if (options.dryRun) {
+          await runArchonMigrationPhase(config, 'pre-deploy', configName, ctx, projectPath,
+            { dryRun: true, run: !options.skipMigrations }, deps);
           printMultiClassDryRun(resolved, resolved.map((r) => r.strategy ?? 'sequential'), ctx.isPlainMode());
           await runArchonMigrationPhase(config, 'post-deploy', configName, ctx, projectPath,
             { dryRun: true, run: !options.skipMigrations }, deps);
           return;
         }
 
-        // ── preflight: HAProxy connectivity + coverage, once, before any class rolls ──
+        // ── preflight: HAProxy connectivity + coverage before migrations ──
         // Only serving classes (haproxy present with a non-empty serverMap) are
         // checked. Skipped entirely under --skip-drain, since drain won't be
-        // attempted this run.
+        // attempted this run. A configured serving ceremony is a hard gate:
+        // schema mutation must not start if the rollout cannot drain every host.
         if (!options.skipDrain) {
           const servingClasses = resolved.filter((rc) => hasActiveServerMap(rc.haproxy));
           for (const rc of servingClasses) {
-            try {
-              const connResult = await testHAProxyConnectivity(rc.haproxy!);
-              if (!connResult.success) {
-                const failedHosts = connResult.results.filter((r) => !r.success).map((r) => `${r.host}: ${r.error}`);
-                ctx.output.warn(`  [${rc.name}] HAProxy connectivity check failed: ${failedHosts.join('; ')}`);
-              }
-            } catch (err) {
-              ctx.output.warn(`  [${rc.name}] HAProxy connectivity check failed: ${getErrorMessage(err)}`);
+            const connResult = await testHAProxyConnectivity(rc.haproxy!);
+            if (!connResult.success) {
+              const failedHosts = connResult.results.filter((r) => !r.success).map((r) => `${r.host}: ${r.error}`);
+              throw new Error(`  [${rc.name}] HAProxy connectivity check failed: ${failedHosts.join('; ')}`);
             }
             const unmapped = getUnmappedHosts(rc.haproxy!, rc.hosts);
             if (unmapped.length > 0) {
-              ctx.output.warn(`  [${rc.name}] host(s) not mapped in haproxy.serverMap (will deploy without drain): ${unmapped.join(', ')}`);
+              throw new Error(`  [${rc.name}] host(s) not mapped in haproxy.serverMap: ${unmapped.join(', ')}`);
             }
           }
         }
+
+        // ── pre-deploy migration phase (after every rollout gate is reachable) ──
+        await runArchonMigrationPhase(config, 'pre-deploy', configName, ctx, projectPath,
+          { dryRun: false, run: !options.skipMigrations }, deps);
 
         const runClass = async (rc: ResolvedClass): Promise<RunClassResult> => {
           const port = rc.port ?? DEFAULT_PORT;
@@ -725,7 +724,11 @@ function registerDeployCommands(deployCmd: Command, ctx: CLIPluginContext, deps?
         await runArchonMigrationPhase(config, 'post-deploy', configName, ctx, projectPath,
           { dryRun: false, run: !options.skipMigrations && noFailures && fullCoverage }, deps);
 
-        if (result.abortedAt) process.exit(1);
+        // Non-blocking classes may finish their attempts so one worker does not
+        // prevent later workers from being updated. The command result remains
+        // strict: a release cannot treat any failed or uncovered host as a
+        // successful fleet deployment.
+        if (result.abortedAt || !noFailures || !fullCoverage) process.exit(1);
       } finally {
         if (config.tunnel) {
           await Promise.all(openTunnels.map((t) => t.close().catch(() => undefined)));

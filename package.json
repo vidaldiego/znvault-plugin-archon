@@ -1,6 +1,6 @@
 {
   "name": "@zincapp/znvault-plugin-archon",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "description": "Archon deployment plugin for zn-vault-agent + znvault CLI (diff deploy, Prisma dynamic-secret migrations, service/reboot control)",
   "type": "module",
   "main": "dist/index.js",
@@ -20,7 +20,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "build:prod": "tsc --sourceMap false",
+    "build:prod": "npm run clean && tsc --sourceMap false --declarationMap false",
     "clean": "rm -rf dist",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",

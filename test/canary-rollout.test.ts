@@ -26,6 +26,7 @@ const {
   openTunnelMock,
   closeTunnelMock,
   getConfigMock,
+  runMigrationsMock,
 } = vi.hoisted(() => ({
   executeStrategyMock: vi.fn(),
   drainServerMock: vi.fn(),
@@ -38,6 +39,7 @@ const {
   openTunnelMock: vi.fn(),
   closeTunnelMock: vi.fn(),
   getConfigMock: vi.fn(),
+  runMigrationsMock: vi.fn(),
 }));
 
 vi.mock('@zincapp/znvault-deploy-core', async () => {
@@ -55,6 +57,11 @@ vi.mock('@zincapp/znvault-deploy-core', async () => {
     testHAProxyConnectivity: testHAProxyConnectivityMock,
     getUnmappedHosts: getUnmappedHostsMock,
   };
+});
+
+vi.mock('@zincapp/znvault-migrate', async () => {
+  const actual = await vi.importActual<typeof import('@zincapp/znvault-migrate')>('@zincapp/znvault-migrate');
+  return {...actual, runMigrations: runMigrationsMock};
 });
 
 // Import AFTER vi.mock so commands.ts binds to the mocked module.
@@ -131,6 +138,7 @@ describe('deploy run — canary rollout + HAProxy drain', () => {
     openTunnelMock.mockResolvedValue({ host: '192.0.2.58', localPort: 49123, close: closeTunnelMock });
     testHAProxyConnectivityMock.mockResolvedValue({ success: true, results: [] });
     getUnmappedHostsMock.mockReturnValue([]);
+    runMigrationsMock.mockResolvedValue(undefined);
     drainServerMock.mockResolvedValue({ success: true, results: [] });
     readyServerMock.mockResolvedValue({ success: true, results: [] });
     performHealthCheckMock.mockResolvedValue({ success: true, status: 200, attempts: 1, totalTime: 10 });
@@ -177,6 +185,27 @@ describe('deploy run — canary rollout + HAProxy drain', () => {
     const readyOrder = readyServerMock.mock.invocationCallOrder[0]!;
     expect(drainOrder).toBeLessThan(postOrder);
     expect(postOrder).toBeLessThan(readyOrder);
+  });
+
+  it('blocks before pre-deploy migration when HAProxy is unreachable', async () => {
+    getConfigMock.mockResolvedValue({
+      ...apiConfig,
+      migration: {roleId: 'archon-rw', migrationsDir: '/tmp/archon-project'},
+    });
+    testHAProxyConnectivityMock.mockResolvedValue({
+      success: false,
+      results: [{host: '198.51.100.20', success: false, error: 'connection refused'}],
+    });
+
+    const ctx = makeCtx();
+    const program = buildProgram(ctx);
+    await expect(
+      program.parseAsync(['node', 'znvault', 'archon', 'deploy', 'run', 'staging']),
+    ).rejects.toThrow(/HAProxy connectivity check failed/);
+
+    expect(runMigrationsMock).not.toHaveBeenCalled();
+    expect(agentPostMock).not.toHaveBeenCalled();
+    expect(drainServerMock).not.toHaveBeenCalled();
   });
 
   it('re-readies a host in `finally` when the deploy fails after a successful drain', async () => {
@@ -283,7 +312,9 @@ describe('deploy run — canary rollout + HAProxy drain', () => {
 
     const ctx = makeCtx();
     const program = buildProgram(ctx);
-    await program.parseAsync(['node', 'znvault', 'archon', 'deploy', 'run', 'staging', '--class', 'worker']);
+    await expect(
+      program.parseAsync(['node', 'znvault', 'archon', 'deploy', 'run', 'staging', '--class', 'worker']),
+    ).rejects.toThrow('process.exit unexpectedly called with "1"');
 
     const calls = agentPostMock.mock.calls.map(([url]) => String(url));
     expect(calls.some((url) => url.endsWith('/deploy'))).toBe(false);
