@@ -251,7 +251,11 @@ describe('deploy run — canary rollout + HAProxy drain', () => {
     expect(readyServerMock).not.toHaveBeenCalled();
     // Worker class deploys directly (bare sequential loop), not via executeStrategy.
     expect(executeStrategyMock).not.toHaveBeenCalled();
-    expect(agentPostMock).toHaveBeenCalledWith(expect.stringContaining('192.0.2.58'), expect.anything());
+    expect(agentPostMock).toHaveBeenCalledWith(
+      expect.stringContaining('/deploy'),
+      expect.anything(),
+      300_000,
+    );
     expect(agentPostMock).toHaveBeenCalledWith(
       expect.stringContaining('/restart'),
       {},
