@@ -56,7 +56,7 @@ jobs:
           sha256sum "$PACKAGE_PATH" > "$RUNNER_TEMP/archon-plugin-package.sha256"
           printf 'PACKAGE_PATH=%s\n' "$PACKAGE_PATH" >> "$GITHUB_ENV"
       - name: Preserve verified artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: archon-plugin-package-${{ github.ref_name }}
           path: |
