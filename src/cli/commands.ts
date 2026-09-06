@@ -72,6 +72,13 @@ const DEFAULT_PORT = 9100;
 // false failure while the node is actually restarting successfully.
 const RESTART_TIMEOUT_MS = 5 * 60_000;
 
+// Applying a production diff can include hundreds of files plus npm ci and
+// Prisma client generation. Keep it on the deployment-operation timeout;
+// agentPost's default is the 30s quick-call timeout and can expire after the
+// remote journal has already committed, leaving new files behind without the
+// restart that activates them.
+const DEPLOY_APPLY_TIMEOUT_MS = 5 * 60_000;
+
 const QUIESCE_POLL_MS = 2_000;
 const QUIESCE_DRAIN_TIMEOUT_MS = 120_000;
 
@@ -482,7 +489,7 @@ function registerDeployCommands(deployCmd: Command, ctx: CLIPluginContext, deps?
                   ctx.output.info(`  [${rc.name}] ${host}: up to date`);
                   return { success: true, result: { success: true, filesChanged: 0, filesDeleted: 0, message: 'No changes', deploymentTime: 0, appName: rc.name } };
                 }
-                await agentPost(`${pluginUrl}/deploy`, payload);
+                await agentPost(`${pluginUrl}/deploy`, payload, DEPLOY_APPLY_TIMEOUT_MS);
                 // Restart the archon service so the new files actually run. WITHOUT
                 // this the deploy is a no-op on running code (new files on disk, old
                 // process still serving) — and for serving classes the subsequent
