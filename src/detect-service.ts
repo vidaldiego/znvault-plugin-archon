@@ -39,7 +39,10 @@ export async function detectArchonService(run: RunFn): Promise<string> {
   // name (first token) only for lines whose LOAD state (second token) is
   // `loaded` — this drops `not-found` and `masked` leftovers that `--all` can
   // surface, so a dead unit reference can't create a false "multiple services"
-  // error or be returned as the service to act on. Blank/short lines are ignored.
+  // error or be returned as the service to act on. The shared secrets-readiness
+  // oneshot is a prerequisite helper, not an Archon application process, so it
+  // must not participate in lifecycle service selection. Blank/short lines are
+  // ignored.
   const units = r.stdout
     .split('\n')
     .map((l) => l.trim())
@@ -47,7 +50,8 @@ export async function detectArchonService(run: RunFn): Promise<string> {
     .map((l) => l.split(/\s+/))
     .filter((cols) => cols.length >= 2 && cols[1] === 'loaded')
     .map((cols) => cols[0])
-    .filter((u): u is string => !!u && u.startsWith('archon-') && u.endsWith('.service'));
+    .filter((u): u is string => !!u && u.startsWith('archon-') && u.endsWith('.service'))
+    .filter((u) => u !== 'archon-secrets-ready.service');
 
   const unique = [...new Set(units)];
 

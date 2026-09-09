@@ -31,6 +31,17 @@ describe('detectArchonService', () => {
     expect(await detectArchonService(run)).toBe('archon-worker.service');
   });
 
+  it('ignores the shared secrets-readiness helper when selecting the application service', async () => {
+    const run = vi.fn().mockResolvedValue({
+      code: 0,
+      stdout:
+        line('archon-api.service') + '\n' +
+        'archon-secrets-ready.service loaded active exited Archon secret readiness gate\n',
+      stderr: '',
+    });
+    expect(await detectArchonService(run)).toBe('archon-api.service');
+  });
+
   it('strips a trailing .service-less name too (accepts either form)', async () => {
     const run = vi.fn().mockResolvedValue({ code: 0, stdout: 'archon-api.service loaded active running Archon Node API\n', stderr: '' });
     expect(await detectArchonService(run)).toBe('archon-api.service');
